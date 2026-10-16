@@ -52,7 +52,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 
 async function loadCatalogs() {
   try {
-    const response = await fetch(`${API_BASE_URL}/caracterizacion/catalogos`);
+    const response = await fetch(`${API_BASE_URL}/caracterizacion/catalogos`, { signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw new Error(`Catálogos: ${response.status}`);
     catalogs = await response.json();
   } catch (error) {
@@ -385,4 +385,7 @@ function handleClick(event) {
   if (target.dataset.removePerson) { readForm(); state.personas.splice(Number(target.dataset.removePerson), 1); render(); }
 }
 
-loadCatalogs().finally(() => { state.step = -1; render(); });
+// Se muestra de inmediato con el catálogo del contrato; si la API responde, se actualiza en segundo plano
+state.step = -1;
+render();
+loadCatalogs().then(() => { if (state.step === -1 && state.view === 'form') render(); });
