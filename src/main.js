@@ -169,7 +169,7 @@ function situacionStep() {
     choice('¿Cómo se enteró de la emergencia?', 'situacion.medioAlerta', OPTIONS.medioAlerta, { required: false }) +
     (s.medioAlerta === 'otro' ? field('¿Cuál?', 'situacion.medioAlertaOtro', { required: true, max: 200 }) : '')) +
     card('Hoy', 'bi-compass-fill',
-      choice('¿Dónde pernocta actualmente el hogar?', 'situacion.lugarPernocta', OPTIONS.lugarPernocta, { layout: 'list' }) +
+      choice('¿Dónde duerme el hogar estos días?', 'situacion.lugarPernocta', OPTIONS.lugarPernocta, { layout: 'list', hint: 'Elige el lugar donde pasan las noches desde la emergencia.' }) +
       choice('Ingresos del hogar', 'situacion.ingresos', OPTIONS.ingresos, { required: false }) +
       (s.ingresos === 'otro' ? field('¿Cuál?', 'situacion.ingresosOtro', { required: true, max: 200 }) : '')) +
     card('Estado de la vivienda', 'bi-house-gear-fill',
