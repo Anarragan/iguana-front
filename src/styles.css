@@ -157,3 +157,11 @@ h1 { color: var(--navy); font-size: clamp(2rem, 9vw, 3rem); font-weight: 800; li
 .toast-ui i { color: #50e3b4; margin-right: 4px; }
 .alert ul { margin: 0; padding-left: 18px; }
 @media (min-width: 700px) { .welcome-page { padding-top: 8vh; } }
+
+/* avance */
+.codes .solo { text-align: center; }
+.codes .solo strong { font-size: 2rem; letter-spacing: .04em; }
+.pasos { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 12px; }
+.paso { font-size: .74rem; font-weight: 600; color: var(--muted); background: #f1f6fb; border-radius: 20px; padding: 4px 10px; display: inline-flex; align-items: center; gap: 5px; }
+.paso.ok { color: #087a5e; background: #e4f6ef; }
+.seg-flag { display: inline-block; margin-top: 6px; font-size: .78rem; font-weight: 700; color: var(--danger); }
