@@ -165,3 +165,9 @@ h1 { color: var(--navy); font-size: clamp(2rem, 9vw, 3rem); font-weight: 800; li
 .paso { font-size: .74rem; font-weight: 600; color: var(--muted); background: #f1f6fb; border-radius: 20px; padding: 4px 10px; display: inline-flex; align-items: center; gap: 5px; }
 .paso.ok { color: #087a5e; background: #e4f6ef; }
 .seg-flag { display: inline-block; margin-top: 6px; font-size: .78rem; font-weight: 700; color: var(--danger); }
+
+/* sesión */
+.session-bar { margin-top: 26px; padding-top: 14px; border-top: 1px solid var(--line); width: 100%; display: flex; justify-content: space-between; align-items: center; font-size: .82rem; color: var(--muted); }
+.session-bar span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.welcome-page .field { margin-bottom: 14px; }
+.welcome-page code { font-size: .8rem; }

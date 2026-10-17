@@ -26,7 +26,9 @@ jobs:
         env:
           # Repo > Settings > Secrets and variables > Actions > Variables
           VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || 'https://iguana-resource-system-production.up.railway.app' }}
-          VITE_API_KEY: ${{ secrets.VITE_API_KEY }}
+          # Públicas por diseño (URL y anon key de Supabase): van como Variables, no como Secrets
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
       # Publica dist/ en la rama gh-pages (Pages > Source: Deploy from a branch > gh-pages / root)
       - uses: peaceiris/actions-gh-pages@v4
         with:

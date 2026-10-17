@@ -1,10 +1,10 @@
 import 'bootstrap/dist/css/bootstrap.min.css';
 import 'bootstrap-icons/font/bootstrap-icons.css';
 import './styles.css';
-import { api, ApiError } from './api.js';
+import { api, ApiError, setUnauthorizedHandler } from './api.js';
+import { authConfigured, linkInfo, getSession, signIn, signOut, setPassword, sendReset, onSignedOut } from './auth.js';
 
 const DRAFT_KEY = 'iguana.borrador.v3';
-const VOL_KEY = 'iguana.aplicadaPor';
 const CONSENTIMIENTO_VERSION = 'v1';
 
 // ---------- utilidades ----------
@@ -20,7 +20,7 @@ const text = v => String(v).trim();
 const PHONE_RE = /^[0-9+()\-\s]{7,30}$/;
 
 const blankData = () => ({
-  aplicadaPor: storage.get(VOL_KEY) || '', autorizaTratamiento: null, autorizaSeguimiento: null, sector: '',
+  autorizaTratamiento: null, autorizaSeguimiento: null, sector: '',
   direccion: '', interior: '', callejon: '', nombreReferencia: '', telefonoContacto: '', observaciones: '',
   respEsJefe: null, respParentesco: '', respGenero: '', respEdad: '',
   numPersonas: '', ninosEdades: [], conteos: {},
@@ -33,10 +33,11 @@ const blankData = () => ({
   ofertaRecibida: null, ofertaAceptada: null, ayudas: {}, ayudasOtra: ''
 });
 
-const blankAvance = () => ({ loading: false, error: '', items: null, estado: '', mios: false, detail: null });
+const blankAvance = () => ({ loading: false, error: '', items: null, estado: '', detail: null });
+const blankAuth = () => ({ email: '', password: '', password2: '', busy: false, msg: '', kind: 'danger' });
 
 const ui = {
-  view: 'home', stepKey: 'consentimiento', ref: null, codigo: null, data: blankData(), errors: {}, banner: [],
+  view: 'boot', user: null, auth: blankAuth(), stepKey: 'consentimiento', ref: null, codigo: null, data: blankData(), errors: {}, banner: [],
   saving: false, catalogs: null, catalogsState: 'loading', anim: null, avance: null, avanceError: '', result: null, lista: blankAvance()
 };
 
@@ -47,7 +48,7 @@ function setVal(path, value) {
   const last = keys.pop();
   keys.reduce((o, k) => (o[k] ??= {}), ui.data)[last] = value;
 }
-const persist = () => { if (ui.view === 'wizard') storage.set(DRAFT_KEY, { ref: ui.ref, codigo: ui.codigo, data: ui.data, stepKey: ui.stepKey }); };
+const persist = () => { if (ui.view === 'wizard') storage.set(DRAFT_KEY, { owner: ui.user, ref: ui.ref, codigo: ui.codigo, data: ui.data, stepKey: ui.stepKey }); };
 
 // ---------- catálogos (toda opción sale de GET /catalogos) ----------
 const options = name => (ui.catalogs?.[name] || []).map(o => ({ v: o.codigo, l: o.etiqueta }));
@@ -114,7 +115,7 @@ function consentimientoScreen() {
   const d = ui.data;
   return card('Antes de empezar', 'bi-shield-check',
     '<div class="info-box"><i class="bi bi-info-circle"></i>Lee en voz alta: <em>«Con su autorización registraremos los datos de su hogar para apoyar la atención de las familias afectadas.»</em></div>' +
-    field('Persona que aplica la ficha', 'aplicadaPor', { required: true, max: 100, placeholder: 'Tu nombre', disabled: locked(), hint: 'Se recordará en este dispositivo.' }) +
+    `<div class="info-box"><i class="bi bi-person-check"></i>Aplicas esta ficha como <strong>${esc(ui.user)}</strong>.</div>` +
     field('Sector o zona', 'sector', { max: 80, placeholder: 'Ej. Zona alta', disabled: locked() }) +
     yesNo('¿Autoriza el tratamiento de sus datos?', 'autorizaTratamiento', { disabled: locked() }) +
     (d.autorizaTratamiento === true ? yesNo('¿Autoriza que le contactemos para seguimiento?', 'autorizaSeguimiento', { disabled: locked() }) : '') +
@@ -289,7 +290,6 @@ const picked = (errors, path, value, msg = 'Elige una opción.') => { if (value 
 
 function validateConsentimiento() {
   const d = ui.data; const e = {};
-  needed(e, 'aplicadaPor', d.aplicadaPor);
   picked(e, 'autorizaTratamiento', d.autorizaTratamiento);
   if (d.autorizaTratamiento === true) picked(e, 'autorizaSeguimiento', d.autorizaSeguimiento);
   return e;
@@ -386,7 +386,7 @@ function contactFields(d) {
 
 function hogarPayload() {
   const d = ui.data;
-  const body = { aplicadaPor: text(d.aplicadaPor), autorizaTratamiento: d.autorizaTratamiento, versionConsentimiento: CONSENTIMIENTO_VERSION };
+  const body = { autorizaTratamiento: d.autorizaTratamiento, versionConsentimiento: CONSENTIMIENTO_VERSION };
   optional(body, 'sector', d.sector);
   if (d.autorizaTratamiento !== true) return body;
   return { ...body, autorizaSeguimiento: d.autorizaSeguimiento, ...contactFields(d) };
@@ -440,14 +440,14 @@ const PAYLOADS = {
 // ---------- vistas ----------
 function render({ keepScroll = true } = {}) {
   const scroll = window.scrollY;
-  const views = { home: homeView, wizard: wizardView, end: endView, lista: listaView, detail: detailView };
+  const views = { boot: bootView, login: loginView, setpass: setpassView, home: homeView, wizard: wizardView, end: endView, lista: listaView, detail: detailView };
   app.innerHTML = views[ui.view]();
   window.scrollTo(0, keepScroll ? scroll : 0);
   ui.anim = null;
 }
 
 function homeView() {
-  const draft = storage.get(DRAFT_KEY);
+  const draft = myDraft();
   const status = ui.catalogsState === 'error'
     ? `<div class="alert alert-warning text-start"><i class="bi bi-wifi-off"></i> ${esc(ui.catalogsError || 'No se pudo cargar el formulario desde el servidor.')} <button class="btn btn-link p-0 align-baseline" data-act="retry-catalogs">Reintentar</button></div>`
     : ui.catalogsState === 'loading' ? '<p class="loading-line"><span class="spinner-border spinner-border-sm"></span> Conectando con el servidor…</p>' : '';
@@ -461,7 +461,52 @@ function homeView() {
       <button class="btn btn-outline-primary w-100" data-act="start">Empezar una ficha nueva</button>
       <button class="btn btn-link text-danger mt-1" data-act="discard"><i class="bi bi-trash"></i> Descartar borrador</button>`
       : '<button class="btn btn-primary btn-lg w-100" data-act="start">Comenzar <i class="bi bi-arrow-right"></i></button>'}
-    <button class="btn btn-link mt-2" data-act="lista"><i class="bi bi-bar-chart-steps"></i> Ver avance de hogares</button>
+    <button class="btn btn-link mt-2" data-act="lista"><i class="bi bi-bar-chart-steps"></i> Ver mis hogares</button>
+    <div class="session-bar"><span><i class="bi bi-person-circle"></i> ${esc(ui.user)}</span><button class="btn btn-link p-0" data-act="logout">Cerrar sesión</button></div>
+  </main>`;
+}
+
+// ---------- sesión ----------
+const authAlert = a => (a.msg ? `<div class="alert alert-${a.kind} text-start fade-in">${esc(a.msg)}</div>` : '');
+const submitLabel = (a, text) => (a.busy ? '<span class="spinner-border spinner-border-sm me-2"></span>Un momento…' : text);
+
+function bootView() {
+  return '<main class="welcome-page"><div class="welcome-mark"><i class="bi bi-house-heart-fill"></i></div><p class="loading-line"><span class="spinner-border spinner-border-sm"></span> Cargando…</p></main>';
+}
+
+function loginView() {
+  const a = ui.auth;
+  if (!authConfigured) {
+    return `<main class="welcome-page"><div class="welcome-mark"><i class="bi bi-gear-wide-connected"></i></div><h1>Falta configurar</h1>
+      <p class="lead">Este sitio no tiene la URL y la clave pública de Supabase (<code>VITE_SUPABASE_URL</code> y <code>VITE_SUPABASE_ANON_KEY</code>).</p></main>`;
+  }
+  return `<main class="welcome-page fade-in">
+    <div class="welcome-mark"><i class="bi bi-house-heart-fill"></i></div>
+    <p class="eyebrow">LA IGUANÁ · MEDELLÍN</p>
+    <h1>Iniciar sesión</h1>
+    <p class="lead">Entra con el correo con el que te invitaron.</p>
+    ${authAlert(a)}
+    <form class="w-100 text-start" data-form="login" novalidate>
+      <div class="field"><label for="email">Correo</label><input class="form-control" id="email" type="email" autocomplete="username" inputmode="email" data-auth="email" value="${esc(a.email)}" required></div>
+      <div class="field"><label for="password">Contraseña</label><input class="form-control" id="password" type="password" autocomplete="current-password" data-auth="password" value="${esc(a.password)}" required></div>
+      <button class="btn btn-primary btn-lg w-100" type="submit" ${a.busy ? 'disabled' : ''}>${submitLabel(a, 'Entrar <i class="bi bi-arrow-right"></i>')}</button>
+    </form>
+    <button class="btn btn-link mt-2" data-act="forgot" ${a.busy ? 'disabled' : ''}>¿Olvidaste tu contraseña?</button>
+  </main>`;
+}
+
+function setpassView() {
+  const a = ui.auth;
+  return `<main class="welcome-page fade-in">
+    <div class="welcome-mark"><i class="bi bi-key-fill"></i></div>
+    <h1>Crea tu contraseña</h1>
+    <p class="lead">Elige una contraseña de al menos 8 caracteres para entrar la próxima vez.</p>
+    ${authAlert(a)}
+    <form class="w-100 text-start" data-form="setpass" novalidate>
+      <div class="field"><label for="password">Contraseña nueva</label><input class="form-control" id="password" type="password" autocomplete="new-password" data-auth="password" value="${esc(a.password)}"></div>
+      <div class="field"><label for="password2">Repite la contraseña</label><input class="form-control" id="password2" type="password" autocomplete="new-password" data-auth="password2" value="${esc(a.password2)}"></div>
+      <button class="btn btn-primary btn-lg w-100" type="submit" ${a.busy ? 'disabled' : ''}>${submitLabel(a, 'Guardar contraseña')}</button>
+    </form>
   </main>`;
 }
 
@@ -496,7 +541,7 @@ function endView() {
     <section class="card-ui w-100 text-start"><h2><i class="bi bi-clipboard-data-fill"></i>Resumen</h2>${resumenRows(r.resumen)}</section>
     <div class="w-100 text-start">${alertsHtml(r)}</div>
     <button class="btn btn-primary w-100" data-act="start"><i class="bi bi-plus-lg"></i> Nueva ficha</button>
-    <button class="btn btn-outline-primary w-100 mt-2" data-act="lista"><i class="bi bi-bar-chart-steps"></i> Ver avance de hogares</button></main>`;
+    <button class="btn btn-outline-primary w-100 mt-2" data-act="lista"><i class="bi bi-bar-chart-steps"></i> Ver mis hogares</button></main>`;
 }
 
 // ---------- avance de hogares (la API no devuelve datos personales) ----------
@@ -510,14 +555,13 @@ function listaView() {
     <div class="d-flex justify-content-between gap-2"><strong>${esc(i.codigo)}</strong>${estadoBadge(i.estado)}</div>
     <small class="text-muted">${esc(i.sector || 'Sin sector')} · ${esc(fechaCorta(i.fechaAplicacion))} · ${esc(i.aplicadaPor || '')}</small>
     ${pasosHtml(i.pasos)}${i.requiereSeguimiento ? '<span class="seg-flag"><i class="bi bi-exclamation-octagon-fill"></i> Requiere seguimiento</span>' : ''}</button>`).join('');
-  return `<div class="app-shell"><header class="topbar"><button class="icon-button" data-act="home" aria-label="Volver"><i class="bi bi-arrow-left"></i></button><strong>Avance de hogares</strong><span></span></header>
+  return `<div class="app-shell"><header class="topbar"><button class="icon-button" data-act="home" aria-label="Volver"><i class="bi bi-arrow-left"></i></button><strong>Mis hogares</strong><span></span></header>
     <main class="container form-container fade-in">
       <div class="opts opts-chips mb-3">${chips}</div>
-      <label class="form-check mb-3"><input class="form-check-input" type="checkbox" data-mios ${l.mios ? 'checked' : ''}> Solo los que apliqué yo (${esc(storage.get(VOL_KEY) || 'sin nombre')})</label>
       ${l.loading ? '<div class="text-center py-5"><span class="spinner-border text-primary"></span></div>' : ''}
       ${l.error ? `<div class="alert alert-danger">${esc(l.error)} <button class="btn btn-link p-0 align-baseline" data-act="lista">Reintentar</button></div>` : ''}
       ${l.items && !l.items.length ? '<p class="empty">No hay hogares con ese filtro.</p>' : cards}
-      <p class="card-note text-center mt-3">Por seguridad, aquí no se muestran nombres, direcciones ni teléfonos. Coordinación los consulta en la base de datos.</p></main></div>`;
+      <p class="card-note text-center mt-3">Aquí solo ves los hogares que tú creaste. Por seguridad no se muestran nombres, direcciones ni teléfonos.</p></main></div>`;
 }
 
 async function loadLista() {
@@ -526,8 +570,6 @@ async function loadLista() {
   render();
   const params = new URLSearchParams({ limite: '100' });
   if (l.estado) params.set('estado', l.estado);
-  const vol = storage.get(VOL_KEY);
-  if (l.mios && vol) params.set('aplicadaPor', vol);
   try {
     l.items = await api('GET', `/hogares?${params}`);
   } catch (error) {
@@ -600,12 +642,12 @@ function previous() {
 }
 
 const clearDraft = () => storage.del(DRAFT_KEY);
+const myDraft = () => { const draft = storage.get(DRAFT_KEY); return draft && draft.owner === ui.user ? draft : null; };
 
 // Envía lo que corresponda al terminar la pantalla. Devuelve 'next' | 'fin-sin-autorizacion' | 'fin-completo'
 async function save(screen) {
   const d = ui.data;
   if (screen.key === 'consentimiento') {
-    storage.set(VOL_KEY, text(d.aplicadaPor));
     if (d.autorizaTratamiento === false && !ui.ref) {
       ui.result = await api('POST', '/hogares', hogarPayload());
       return 'fin-sin-autorizacion';
@@ -685,7 +727,7 @@ async function startNew() {
 }
 
 async function resume() {
-  const draft = storage.get(DRAFT_KEY);
+  const draft = myDraft();
   if (!draft || !(await ensureCatalogs())) return;
   Object.assign(ui, { view: 'wizard', stepKey: draft.stepKey, ref: draft.ref, codigo: draft.codigo, avance: null, data: { ...blankData(), ...draft.data }, errors: {}, banner: [], anim: 'fwd' });
   render({ keepScroll: false });
@@ -730,7 +772,7 @@ app.addEventListener('click', event => {
     persist(); render(); return;
   }
   const actions = {
-    start: startNew, resume, next, back: () => (ui.view === 'wizard' ? previous() : null),
+    start: startNew, resume, next, logout, forgot: doForgot, back: () => (ui.view === 'wizard' ? previous() : null),
     home: () => { ui.view = 'home'; render({ keepScroll: false }); },
     discard: () => { if (confirm('¿Descartar el borrador de este dispositivo? Lo ya enviado al servidor no se borra.')) { clearDraft(); render(); } },
     lista: () => { const keep = ui.view === 'detail' || ui.view === 'lista' ? ui.lista : blankAvance(); ui.lista = keep; ui.view = 'lista'; loadLista(); },
@@ -747,6 +789,7 @@ app.addEventListener('click', event => {
 
 app.addEventListener('input', event => {
   const el = event.target;
+  if (el.dataset.auth) { ui.auth[el.dataset.auth] = el.value; return; }
   if (!el.dataset.path) return;
   setVal(el.dataset.path, el.value);
   delete ui.errors[el.dataset.path];
@@ -756,7 +799,6 @@ app.addEventListener('input', event => {
 
 app.addEventListener('change', event => {
   const el = event.target;
-  if (el.dataset.mios !== undefined) { ui.lista.mios = el.checked; loadLista(); return; }
   if (el.dataset.prio === undefined) return;
   const slots = ui.data.urgentes;
   const index = Number(el.dataset.prio);
@@ -765,5 +807,88 @@ app.addEventListener('change', event => {
   persist(); render();
 });
 
-render();
-loadCatalogs();
+// ---------- arranque y sesión ----------
+const loginMessage = (message, kind = 'danger') => { ui.auth = { ...blankAuth(), msg: message, kind }; };
+
+function resetSession(message) {
+  clearDraft(); // contrato §5.8: al cerrar sesión se borra el borrador del dispositivo
+  Object.assign(ui, { user: null, view: 'login', ref: null, codigo: null, avance: null, data: blankData(), catalogs: null, catalogsState: 'loading', lista: blankAvance() });
+  if (message) loginMessage(message);
+  render({ keepScroll: false });
+}
+
+async function logout() {
+  await signOut();
+  resetSession();
+}
+
+async function enterApp(session) {
+  ui.user = session.user.email;
+  ui.view = 'home';
+  render({ keepScroll: false });
+  loadCatalogs();
+}
+
+async function doLogin() {
+  const a = ui.auth;
+  if (!a.email.trim() || !a.password) { a.msg = 'Escribe tu correo y tu contraseña.'; a.kind = 'danger'; render(); return; }
+  a.busy = true; a.msg = ''; render();
+  try {
+    await enterApp(await signIn(a.email, a.password));
+    ui.auth = blankAuth();
+  } catch (error) {
+    ui.auth = { ...blankAuth(), email: a.email, msg: error.message };
+    render();
+  }
+}
+
+async function doSetPassword() {
+  const a = ui.auth;
+  if (a.password.length < 8) { a.msg = 'La contraseña debe tener al menos 8 caracteres.'; a.kind = 'danger'; render(); return; }
+  if (a.password !== a.password2) { a.msg = 'Las contraseñas no coinciden.'; a.kind = 'danger'; render(); return; }
+  a.busy = true; a.msg = ''; render();
+  try {
+    await setPassword(a.password);
+    ui.auth = blankAuth();
+    await enterApp(await getSession());
+    history.replaceState(null, '', window.location.pathname);
+  } catch (error) {
+    ui.auth = { ...blankAuth(), msg: error.message };
+    render();
+  }
+}
+
+async function doForgot() {
+  const a = ui.auth;
+  if (!a.email.trim()) { a.msg = 'Escribe tu correo arriba y vuelve a pulsar «¿Olvidaste tu contraseña?».'; a.kind = 'warning'; render(); return; }
+  a.busy = true; a.msg = ''; render();
+  try {
+    await sendReset(a.email);
+    ui.auth = { ...blankAuth(), email: a.email, msg: 'Si el correo está registrado, te enviamos un enlace para crear una contraseña nueva.', kind: 'success' };
+  } catch (error) {
+    ui.auth = { ...blankAuth(), email: a.email, msg: error.message };
+  }
+  render();
+}
+
+app.addEventListener('submit', event => {
+  event.preventDefault();
+  if (event.target.dataset.form === 'login') doLogin();
+  if (event.target.dataset.form === 'setpass') doSetPassword();
+});
+
+setUnauthorizedHandler(() => { if (ui.user) logout().then(() => { loginMessage('Tu sesión venció. Inicia sesión de nuevo; tu borrador se descartó por seguridad.', 'warning'); render(); }); });
+onSignedOut(() => { if (ui.user) resetSession(); });
+
+async function init() {
+  render();
+  if (!authConfigured) { ui.view = 'login'; render(); return; }
+  const session = await getSession();
+  if (linkInfo.error) { ui.view = 'login'; loginMessage('El enlace venció o ya se usó. Pide uno nuevo con «¿Olvidaste tu contraseña?».', 'warning'); render(); return; }
+  if (session && (linkInfo.type === 'invite' || linkInfo.type === 'recovery')) { ui.user = session.user.email; ui.view = 'setpass'; render(); return; }
+  if (session) { await enterApp(session); return; }
+  ui.view = 'login';
+  render();
+}
+
+init();
