@@ -1,391 +1,765 @@
 import 'bootstrap/dist/css/bootstrap.min.css';
 import 'bootstrap-icons/font/bootstrap-icons.css';
 import './styles.css';
+import { api, ApiError } from './api.js';
+import { OPTIONS, NIVELES_DANO, labelOf } from './options.js';
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
-const STORE_KEY = 'iguana.registros';
+const DRAFT_KEY = 'iguana.borrador.v2';
+const VOL_KEY = 'iguana.voluntario';
+const CONSENTIMIENTO_VERSION = 'v1';
 
-const fallbackCatalogs = {
-  categoriasAfectacion: [
-    { valor: 'vivienda', etiqueta: 'Vivienda' }, { valor: 'enseres', etiqueta: 'Enseres' },
-    { valor: 'alimentos', etiqueta: 'Alimentos' }, { valor: 'ropa', etiqueta: 'Ropa' },
-    { valor: 'comercio', etiqueta: 'Comercio' }, { valor: 'ingresos', etiqueta: 'Ingresos' },
-    { valor: 'otro', etiqueta: 'Otro' }
-  ],
-  nivelesAfectacion: [
-    { valor: 'leve', etiqueta: 'Leve' }, { valor: 'moderado', etiqueta: 'Moderado' },
-    { valor: 'grave', etiqueta: 'Grave' }, { valor: 'perdida_total', etiqueta: 'Pérdida total' }
-  ],
-  categoriasNecesidad: [
-    { valor: 'alimentacion', etiqueta: 'Alimentación' }, { valor: 'alojamiento', etiqueta: 'Alojamiento' },
-    { valor: 'aseo', etiqueta: 'Aseo' }, { valor: 'ropa', etiqueta: 'Ropa' },
-    { valor: 'enseres', etiqueta: 'Enseres' }, { valor: 'salud', etiqueta: 'Salud' },
-    { valor: 'recuperacion_economica', etiqueta: 'Recuperación económica' }, { valor: 'otro', etiqueta: 'Otro' }
-  ],
-  nivelesUrgencia: [
-    { valor: 'baja', etiqueta: 'Baja' }, { valor: 'media', etiqueta: 'Media' }, { valor: 'alta', etiqueta: 'Alta' }
-  ]
+// ---------- utilidades ----------
+const storage = {
+  get(key) { try { return JSON.parse(localStorage.getItem(key)); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* sin almacenamiento */ } },
+  del(key) { try { localStorage.removeItem(key); } catch { /* sin almacenamiento */ } }
 };
+const esc = (value = '') => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[c]));
+const pad = n => String(n).padStart(2, '0');
+const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const isBlank = v => v === null || v === undefined || String(v).trim() === '';
+const toInt = v => (/^\d+$/.test(String(v).trim()) ? Number(v) : NaN);
+const sortByOrder = list => [...(list || [])].sort((a, b) => (a.orden ?? 0) - (b.orden ?? 0));
+const PHONE_RE = /^[0-9+()\-\s]{7,30}$/;
 
-const blankConsulta = () => ({ query: '', loading: false, message: '', kind: 'info', items: null, detail: null });
-const blankState = () => ({
-  view: 'form', step: 0, submitted: null, apiError: '', fieldErrors: {}, consulta: blankConsulta(),
-  hogar: { direccionReferencia: '', observaciones: '' },
-  familia: { nombreReferencia: '', telefonoContacto: '' },
-  personas: [{ nombres: '', fechaNacimiento: '', requiereApoyo: false, observaciones: '' }],
-  afectaciones: [], necesidades: []
+const blankData = () => ({
+  voluntario: storage.get(VOL_KEY) || '', fechaAplicacion: todayStr(), autorizaTratamiento: null, autorizaSeguimiento: null,
+  vivienda: { direccion: '', interior: '', callejon: '', materialParedes: '', nivelAguaMax: '', inundadaAntes: '' },
+  hogar: { nombreReferencia: '', telefonoContacto: '' }, observaciones: '',
+  respondente: { esJefe: null, parentesco: '', genero: '', edad: '' },
+  numPersonas: '', menores: [], grupos: {},
+  escolaridad: { dejaronDeAsistir: null, diasSinAsistir: '', manejoEstudios: '', manejoOtro: '' },
+  situacion: { medioAlerta: '', medioAlertaOtro: '', lugarPernocta: '', ingresos: '', ingresosOtro: '', electricaDanada: null, lodo: '', acceso: '', viviendaVista: null, apoyoEmocional: null, numMascotas: 0 },
+  danos: {},
+  necesidades: {}, prioridades: ['', '', ''],
+  visitantes: {}, visitanteOtro: '',
+  atencion: { censoPrevio: '', censoQuien: '', dictamen: '', inscritaRud: '', ofertaRecibida: null, ofertaAceptada: null },
+  ayudas: {}
 });
 
-let state = blankState();
-let catalogs = fallbackCatalogs;
+const blankConsulta = () => ({ loading: false, error: '', items: null, q: '', detail: null });
 
-const steps = ['Hogar', 'Familia', 'Personas', 'Afectaciones', 'Necesidades'];
+const ui = {
+  view: 'home', stepKey: 'consentimiento', idFicha: null, data: blankData(), errors: {}, banner: [],
+  saving: false, catalogs: null, catalogsState: 'loading', anim: null, result: null, consulta: blankConsulta()
+};
+
 const app = document.querySelector('#app');
-const esc = (value = '') => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
-const optionList = (items, selected = '') => items.map(item => `<option value="${esc(item.valor)}" ${item.valor === selected ? 'selected' : ''}>${esc(item.etiqueta)}</option>`).join('');
-const labelFor = (items, value) => items.find(item => item.valor === value)?.etiqueta || value;
+const val = path => path.split('.').reduce((o, k) => o?.[k], ui.data);
+function setVal(path, value) {
+  const keys = path.split('.');
+  const last = keys.pop();
+  keys.reduce((o, k) => (o[k] ??= {}), ui.data)[last] = value;
+}
+const cat = (list, code) => ui.catalogs?.[list]?.find(i => i.codigo === code)?.etiqueta || code;
+const persist = () => { if (ui.view === 'wizard') storage.set(DRAFT_KEY, { idFicha: ui.idFicha, data: ui.data, stepKey: ui.stepKey }); };
 
-// Límites del contrato, por nombre de campo
-const limits = { direccionReferencia: 200, observaciones: 500, observacionesHogar: 500, nombreReferencia: 150, telefonoContacto: 30, nombres: 150, descripcion: 1000 };
-const maxFor = name => limits[name.split('.').pop()] || '';
-const today = () => new Date().toISOString().slice(0, 10);
+// ---------- componentes ----------
+const requiredMark = required => (required ? ' <span class="required">*</span>' : ' <span class="optional">(opcional)</span>');
+const errorOf = path => (ui.errors[path] ? `<div class="field-error"><i class="bi bi-exclamation-circle"></i> ${esc(ui.errors[path])}</div>` : '');
 
-async function loadCatalogs() {
-  try {
-    const response = await fetch(`${API_BASE_URL}/caracterizacion/catalogos`, { signal: AbortSignal.timeout(8000) });
-    if (!response.ok) throw new Error(`Catálogos: ${response.status}`);
-    catalogs = await response.json();
-  } catch (error) {
-    console.warn('No fue posible cargar catálogos; se usan los valores del contrato.', error);
+function field(label, path, { type = 'text', required = false, max = '', placeholder = '', inputmode = '', hint = '', min = '', maxValue = '', disabled = false, area = false } = {}) {
+  const common = `class="form-control" id="${path}" data-path="${path}" placeholder="${esc(placeholder)}" ${max ? `maxlength="${max}"` : ''} ${disabled ? 'disabled' : ''}`;
+  const control = area
+    ? `<textarea ${common} rows="3">${esc(val(path) ?? '')}</textarea>`
+    : `<input ${common} type="${type}" value="${esc(val(path) ?? '')}" ${inputmode ? `inputmode="${inputmode}"` : ''} ${min !== '' ? `min="${min}"` : ''} ${maxValue !== '' ? `max="${maxValue}"` : ''}>`;
+  return `<div class="field ${ui.errors[path] ? 'has-error' : ''}"><label for="${path}">${label}${requiredMark(required)}</label>${control}${hint ? `<div class="hint">${hint}</div>` : ''}${errorOf(path)}</div>`;
+}
+
+function choice(label, path, options, { required = true, layout = 'chips', disabled = false, hint = '' } = {}) {
+  const current = val(path);
+  const buttons = options.map(o => `<button type="button" class="opt ${current === o.v ? 'on' : ''}" data-choice="${path}" data-value="${esc(JSON.stringify(o.v))}" data-clear="${required ? 0 : 1}" aria-pressed="${current === o.v}" ${disabled ? 'disabled' : ''}>${esc(o.l)}</button>`).join('');
+  return `<div class="field ${ui.errors[path] ? 'has-error' : ''}"><div class="label">${label}${requiredMark(required)}</div>${hint ? `<div class="hint mb-2">${hint}</div>` : ''}<div class="opts opts-${layout}" role="group">${buttons}</div>${errorOf(path)}</div>`;
+}
+const YES_NO = [{ v: true, l: 'Sí' }, { v: false, l: 'No' }];
+const yesNo = (label, path, opts = {}) => choice(label, path, YES_NO, { layout: 'seg', ...opts });
+
+function stepper(label, path, { min = 0, max = 99, required = false, hint = '' } = {}) {
+  const raw = val(path);
+  const shown = raw === '' || raw === undefined ? (min === 0 ? 0 : '—') : raw;
+  return `<div class="field stepper-row ${ui.errors[path] ? 'has-error' : ''}"><div class="stepper-label"><div class="label">${label}${required ? ' <span class="required">*</span>' : ''}</div>${hint ? `<div class="hint">${hint}</div>` : ''}</div>
+    <div class="stepper"><button type="button" data-stepper="${path}" data-delta="-1" data-min="${min}" data-max="${max}" aria-label="Menos">−</button><output>${shown}</output><button type="button" data-stepper="${path}" data-delta="1" data-min="${min}" data-max="${max}" aria-label="Más">+</button></div>${errorOf(path)}</div>`;
+}
+
+const card = (title, icon, body, note = '') => `<section class="card-ui"><h2><i class="bi ${icon}"></i>${title}</h2>${note ? `<p class="card-note">${note}</p>` : ''}${body}</section>`;
+
+// ---------- pasos ----------
+const hasMenores = d => d.menores.length > 0;
+const locked = () => Boolean(ui.idFicha);
+
+const STEPS = [
+  { key: 'consentimiento', title: 'Consentimiento', icon: 'bi-shield-check', render: consentimientoStep, validate: validateConsentimiento },
+  { key: 'vivienda', title: 'Vivienda y hogar', icon: 'bi-house-heart-fill', render: viviendaStep, validate: validateVivienda },
+  { key: 'respondente', title: 'Quien responde', icon: 'bi-person-fill', render: respondenteStep, validate: validateRespondente },
+  { key: 'grupos', title: 'Integrantes', icon: 'bi-people-fill', render: gruposStep, validate: validateGrupos },
+  { key: 'escolaridad', title: 'Escolaridad', icon: 'bi-backpack2-fill', show: hasMenores, render: escolaridadStep, validate: validateEscolaridad },
+  { key: 'situacion', title: 'Situación actual', icon: 'bi-compass-fill', render: situacionStep, validate: validateSituacion },
+  { key: 'danos', title: 'Daños', icon: 'bi-exclamation-triangle-fill', render: danosStep, validate: validateDanos },
+  { key: 'necesidades', title: 'Necesidades', icon: 'bi-heart-fill', render: necesidadesStep, validate: validateNecesidades },
+  { key: 'visitantes', title: 'Visitas recibidas', icon: 'bi-signpost-split-fill', render: visitantesStep, validate: validateVisitantes },
+  { key: 'atencion', title: 'Atención recibida', icon: 'bi-hand-thumbs-up-fill', render: atencionStep, validate: validateAtencion },
+  { key: 'cierre', title: 'Cierre', icon: 'bi-flag-fill', render: cierreStep, validate: () => ({}) }
+];
+const visibleSteps = () => STEPS.filter(s => !s.show || s.show(ui.data));
+const currentStep = () => STEPS.find(s => s.key === ui.stepKey) || STEPS[0];
+
+function consentimientoStep() {
+  const d = ui.data;
+  return card('Antes de empezar', 'bi-shield-check',
+    `<div class="info-box"><i class="bi bi-info-circle"></i>Lee en voz alta: <em>«Con su autorización registraremos los datos de su hogar para apoyar la atención de las familias afectadas.»</em></div>` +
+    field('Persona que aplica la ficha', 'voluntario', { required: true, max: 100, placeholder: 'Tu nombre', disabled: locked(), hint: 'Se recordará en este dispositivo.' }) +
+    field('Fecha de aplicación', 'fechaAplicacion', { type: 'date', required: true, maxValue: todayStr(), disabled: locked() }) +
+    yesNo('¿Autoriza el tratamiento de sus datos?', 'autorizaTratamiento', { disabled: locked() }) +
+    (d.autorizaTratamiento === true ? yesNo('¿Autoriza que le contactemos para seguimiento?', 'autorizaSeguimiento', { disabled: locked() }) : '') +
+    (d.autorizaTratamiento === false ? '<div class="info-box warn"><i class="bi bi-slash-circle"></i>Sin autorización no se registran más datos. La ficha terminará aquí.</div>' : ''));
+}
+
+function viviendaStep() {
+  const lock = locked();
+  return (lock ? '<div class="info-box"><i class="bi bi-lock"></i>Estos datos ya se guardaron y no se pueden cambiar aquí.</div>' : '') +
+    card('Vivienda', 'bi-house-door-fill',
+      field('Dirección', 'vivienda.direccion', { required: true, max: 200, placeholder: 'Ej. Cra 80 # 50-10', disabled: lock }) +
+      '<div class="row-2">' + field('Interior', 'vivienda.interior', { max: 30, disabled: lock }) + field('Callejón', 'vivienda.callejon', { max: 100, disabled: lock }) + '</div>' +
+      choice('Material de las paredes', 'vivienda.materialParedes', OPTIONS.materialParedes, { layout: 'list', disabled: lock }) +
+      choice('Nivel máximo que alcanzó el agua', 'vivienda.nivelAguaMax', OPTIONS.nivelAguaMax, { disabled: lock }) +
+      choice('¿La vivienda se había inundado antes?', 'vivienda.inundadaAntes', OPTIONS.inundadaAntes, { layout: 'seg', disabled: lock })) +
+    card('Hogar', 'bi-people-fill',
+      field('Nombre de referencia', 'hogar.nombreReferencia', { required: true, max: 150, placeholder: 'Ej. María Gómez', disabled: lock }) +
+      field('Teléfono de contacto', 'hogar.telefonoContacto', { type: 'tel', inputmode: 'tel', max: 30, placeholder: 'Ej. 3001234567', disabled: lock }) +
+      field('Observaciones', 'observaciones', { area: true, max: 500, placeholder: 'Información adicional', disabled: lock }));
+}
+
+function respondenteStep() {
+  const r = ui.data.respondente;
+  return card('Persona que responde', 'bi-person-fill',
+    yesNo('¿Es la persona jefe de hogar?', 'respondente.esJefe') +
+    (r.esJefe === false ? field('Parentesco con el jefe de hogar', 'respondente.parentesco', { required: true, max: 50, placeholder: 'Ej. Hija' }) : '') +
+    choice('Género', 'respondente.genero', OPTIONS.genero, { required: false }) +
+    field('Edad', 'respondente.edad', { type: 'number', inputmode: 'numeric', min: 0, maxValue: 120, placeholder: 'Años' }));
+}
+
+function gruposStep() {
+  const d = ui.data;
+  const n = toInt(d.numPersonas);
+  const maxCount = Number.isNaN(n) ? 0 : n;
+  const menores = d.menores.map((age, i) => `<div class="menor-row ${ui.errors[`menores.${i}`] ? 'has-error' : ''}"><span class="number">${i + 1}</span>
+      <input class="form-control" type="number" inputmode="numeric" min="0" max="17" placeholder="Edad (0–17)" data-path="menores.${i}" value="${esc(age)}" aria-label="Edad del niño o niña ${i + 1}">
+      <button type="button" class="icon-btn" data-act="del-menor" data-index="${i}" aria-label="Quitar"><i class="bi bi-x-lg"></i></button></div>${errorOf(`menores.${i}`)}`).join('');
+  const grupos = sortByOrder(ui.catalogs.gruposIntegrantes).map(g => stepper(esc(g.etiqueta), `grupos.${g.codigo}`, { min: 0, max: maxCount || 0 })).join('');
+  return card('Personas del hogar', 'bi-people-fill',
+    stepper('Número de personas que viven en el hogar', 'numPersonas', { min: 1, max: 40, required: true }) +
+    `<div class="field ${ui.errors.menores ? 'has-error' : ''}"><div class="label">Niños y niñas (menores de 18)${requiredMark(false)}</div>
+      <div class="hint mb-2">Escribe la edad de cada uno. Total: <strong>${d.menores.length}</strong></div>${menores}
+      <button type="button" class="btn btn-outline-primary btn-sm mt-1" data-act="add-menor"><i class="bi bi-plus-lg"></i> Agregar niño o niña</button>${errorOf('menores')}</div>`) +
+    card('Grupos de integrantes', 'bi-diagram-3-fill', grupos, 'Deja en 0 los grupos que no aplican. Ninguno puede superar el número de personas.');
+}
+
+function escolaridadStep() {
+  const e = ui.data.escolaridad;
+  return card('Escolaridad de niños y niñas', 'bi-backpack2-fill',
+    yesNo('¿Dejaron de asistir al estudio por la emergencia?', 'escolaridad.dejaronDeAsistir') +
+    (e.dejaronDeAsistir === true ? stepper('Días sin asistir', 'escolaridad.diasSinAsistir', { min: 0, max: 365, required: true }) : '') +
+    choice('¿Cómo manejan los estudios ahora?', 'escolaridad.manejoEstudios', OPTIONS.manejoEstudios) +
+    (e.manejoEstudios === 'otro' ? field('¿Cuál?', 'escolaridad.manejoOtro', { required: true, max: 200 }) : ''));
+}
+
+function situacionStep() {
+  const s = ui.data.situacion;
+  return card('Durante la emergencia', 'bi-bell-fill',
+    choice('¿Cómo se enteró de la emergencia?', 'situacion.medioAlerta', OPTIONS.medioAlerta, { required: false }) +
+    (s.medioAlerta === 'otro' ? field('¿Cuál?', 'situacion.medioAlertaOtro', { required: true, max: 200 }) : '')) +
+    card('Hoy', 'bi-compass-fill',
+      choice('¿Dónde pernocta actualmente el hogar?', 'situacion.lugarPernocta', OPTIONS.lugarPernocta, { layout: 'list' }) +
+      choice('Ingresos del hogar', 'situacion.ingresos', OPTIONS.ingresos, { required: false }) +
+      (s.ingresos === 'otro' ? field('¿Cuál?', 'situacion.ingresosOtro', { required: true, max: 200 }) : '')) +
+    card('Estado de la vivienda', 'bi-house-gear-fill',
+      yesNo('¿La instalación eléctrica quedó dañada?', 'situacion.electricaDanada') +
+      choice('¿Cuánto lodo hay en la vivienda?', 'situacion.lodo', OPTIONS.lodo, { layout: 'seg' }) +
+      choice('Acceso a la vivienda', 'situacion.acceso', OPTIONS.acceso, { layout: 'seg' }) +
+      yesNo('¿Ha podido ver su vivienda después de la emergencia?', 'situacion.viviendaVista', { required: false }) +
+      yesNo('¿Necesita apoyo emocional?', 'situacion.apoyoEmocional', { required: false }) +
+      stepper('Mascotas en el hogar', 'situacion.numMascotas', { min: 0, max: 30 }));
+}
+
+const danoTotal = () => Object.values(ui.data.danos).reduce((sum, v) => sum + (Number.isInteger(v) ? v : 0), 0);
+
+function danosStep() {
+  const rows = sortByOrder(ui.catalogs.categoriasDano).map(c => {
+    const current = ui.data.danos[c.codigo];
+    return `<div class="dano-row ${ui.errors[`danos.${c.codigo}`] ? 'has-error' : ''}"><div class="dano-name">${esc(c.etiqueta)}</div>
+      <div class="scale" role="group" aria-label="${esc(c.etiqueta)}">${NIVELES_DANO.map(n => `<button type="button" class="scale-btn lv${n.v} ${current === n.v ? 'on' : ''}" data-choice="danos.${c.codigo}" data-value="${n.v}" data-clear="0" aria-pressed="${current === n.v}"><b>${n.v}</b><span>${n.l}</span></button>`).join('')}</div>${errorOf(`danos.${c.codigo}`)}</div>`;
+  }).join('');
+  return card('Nivel de daño por categoría', 'bi-exclamation-triangle-fill', rows, 'Responde las 8. «Sin daño» también es una respuesta.') +
+    `<div class="total-pill"><span>Total de daño</span><strong>${danoTotal()}</strong><small>de ${sortByOrder(ui.catalogs.categoriasDano).length * 4}</small></div>`;
+}
+
+function necesidadesStep() {
+  const d = ui.data;
+  const items = ui.catalogs.itemsNecesidad;
+  const groups = sortByOrder(ui.catalogs.gruposNecesidad).map(g => {
+    const list = sortByOrder(items.filter(i => i.grupo === g.codigo));
+    if (!list.length) return '';
+    return `<div class="need-group"><div class="need-title">${esc(g.etiqueta)}</div><div class="opts opts-chips">${list.map(i => {
+      const on = i.codigo in d.necesidades;
+      return `<button type="button" class="opt ${on ? 'on' : ''}" data-toggle="necesidades:${i.codigo}" aria-pressed="${on}">${esc(i.etiqueta)}</button>`;
+    }).join('')}</div>${g.codigo === 'salud_cuidado' && 'otro_condicion_especial' in d.necesidades ? field('Describe la condición especial', 'necesidades.otro_condicion_especial.detalle', { required: true, max: 300, placeholder: 'Ej. Pañales para adulto mayor' }) : ''}</div>`;
+  }).join('');
+  const selected = Object.keys(d.necesidades);
+  const prios = selected.length ? `<div class="prio">${[0, 1, 2].map(i => `<div class="prio-row"><span class="number">${i + 1}</span><select class="form-select" data-prio="${i}" aria-label="Prioridad ${i + 1}"><option value="">${i === 0 ? 'Lo más urgente…' : 'Elegir…'}</option>${selected.filter(code => d.prioridades[i] === code || !d.prioridades.includes(code)).map(code => `<option value="${code}" ${d.prioridades[i] === code ? 'selected' : ''}>${esc(cat('itemsNecesidad', code))}</option>`).join('')}</select></div>`).join('')}</div>` : '<p class="card-note mb-0">Marca primero las necesidades para poder priorizarlas.</p>';
+  return card('¿Qué necesita el hogar?', 'bi-heart-fill', groups, 'Marca solo lo que necesitan. Puedes dejarlo vacío.') +
+    card('Las 3 más urgentes', 'bi-sort-numeric-down', prios, 'Opcional. No se pueden repetir.');
+}
+
+function visitantesStep() {
+  const d = ui.data;
+  const buttons = sortByOrder(ui.catalogs.actores).map(a => {
+    const on = Boolean(d.visitantes[a.codigo]);
+    const off = a.codigo !== 'nadie' && d.visitantes.nadie;
+    return `<button type="button" class="opt ${on ? 'on' : ''}" data-toggle="visitantes:${a.codigo}" aria-pressed="${on}" ${off ? 'disabled' : ''}>${esc(a.etiqueta)}</button>`;
+  }).join('');
+  return card('¿Quién ha visitado el hogar?', 'bi-signpost-split-fill',
+    `<div class="field ${ui.errors.visitantes ? 'has-error' : ''}"><div class="opts opts-chips">${buttons}</div>${errorOf('visitantes')}</div>` +
+    (d.visitantes.otro ? field('¿Quién más?', 'visitanteOtro', { required: true, max: 200, placeholder: 'Ej. Parroquia' }) : ''),
+    'Puedes marcar varias. «Nadie» desmarca las demás.');
+}
+
+function atencionStep() {
+  const a = ui.data.atencion;
+  const ayudas = sortByOrder(ui.catalogs.tiposAyuda).map(t => {
+    const on = Boolean(ui.data.ayudas[t.codigo]);
+    return `<button type="button" class="opt ${on ? 'on' : ''}" data-toggle="ayudas:${t.codigo}" aria-pressed="${on}" ${ui.data.ayudas.ninguna ? 'disabled' : ''}>${esc(t.etiqueta)}</button>`;
+  }).join('') + `<button type="button" class="opt ${ui.data.ayudas.ninguna ? 'on' : ''}" data-toggle="ayudas:ninguna" aria-pressed="${Boolean(ui.data.ayudas.ninguna)}">Ninguna</button>`;
+  return card('Censo y evaluación', 'bi-clipboard2-check-fill',
+    choice('¿Ya los habían censado antes?', 'atencion.censoPrevio', OPTIONS.censoPrevio, { layout: 'seg' }) +
+    (a.censoPrevio === 'si' ? field('¿Quién los censó?', 'atencion.censoQuien', { max: 150, placeholder: 'Ej. Alcaldía' }) : '') +
+    choice('Dictamen de la vivienda', 'atencion.dictamen', OPTIONS.dictamen, { layout: 'list' }) +
+    choice('¿Está inscrita en el RUD?', 'atencion.inscritaRud', OPTIONS.inscritaRud, { layout: 'seg' })) +
+    card('Ayudas', 'bi-box2-heart-fill',
+      yesNo('¿Han recibido alguna oferta de atención?', 'atencion.ofertaRecibida') +
+      (a.ofertaRecibida === true ? yesNo('¿La aceptaron?', 'atencion.ofertaAceptada') : '') +
+      `<div class="field ${ui.errors.ayudas ? 'has-error' : ''}"><div class="label">Ayudas recibidas${requiredMark(true)}</div><div class="opts opts-chips">${ayudas}</div>${errorOf('ayudas')}</div>`);
+}
+
+function cierreStep() {
+  const d = ui.data;
+  const rows = [
+    ['bi-person-fill', 'Quien responde', d.respondente.esJefe ? 'Jefe de hogar' : `Parentesco: ${d.respondente.parentesco || '—'}`],
+    ['bi-people-fill', 'Personas en el hogar', `${d.numPersonas || 0} (${d.menores.length} niños y niñas)`],
+    ['bi-house-door-fill', 'Duerme en', labelOf(OPTIONS.lugarPernocta, d.situacion.lugarPernocta) || '—'],
+    ['bi-exclamation-triangle-fill', 'Total de daño', `${danoTotal()} de ${sortByOrder(ui.catalogs.categoriasDano).length * 4}`],
+    ['bi-heart-fill', 'Necesidades marcadas', Object.keys(d.necesidades).length],
+    ['bi-signpost-split-fill', 'Visitas', Object.keys(d.visitantes).filter(k => d.visitantes[k]).length || 0]
+  ];
+  return card('Resumen de la ficha', 'bi-flag-fill', rows.map(([icon, title, text]) => summaryRow(icon, title, text)).join(''), 'Al completar, la ficha se cierra y ya no se puede editar. Las alertas de seguimiento se calcularán con lo respondido.');
+}
+
+function summaryRow(icon, title, text) {
+  return `<div class="summary-row"><i class="bi ${icon}"></i><span><strong>${esc(title)}</strong><small>${esc(text)}</small></span></div>`;
+}
+
+// ---------- validación ----------
+const needed = (errors, path, value, msg = 'Este dato es obligatorio.') => { if (isBlank(value)) errors[path] = msg; };
+const picked = (errors, path, value, msg = 'Elige una opción.') => { if (value === null || value === undefined || value === '') errors[path] = msg; };
+
+function validateConsentimiento() {
+  const d = ui.data; const e = {};
+  needed(e, 'voluntario', d.voluntario);
+  if (isBlank(d.fechaAplicacion)) e.fechaAplicacion = 'Indica la fecha.';
+  else if (d.fechaAplicacion > todayStr()) e.fechaAplicacion = 'La fecha no puede ser futura.';
+  picked(e, 'autorizaTratamiento', d.autorizaTratamiento);
+  if (d.autorizaTratamiento === true) picked(e, 'autorizaSeguimiento', d.autorizaSeguimiento);
+  return e;
+}
+function validateVivienda() {
+  const d = ui.data; const e = {};
+  if (locked()) return e;
+  needed(e, 'vivienda.direccion', d.vivienda.direccion);
+  picked(e, 'vivienda.materialParedes', d.vivienda.materialParedes);
+  picked(e, 'vivienda.nivelAguaMax', d.vivienda.nivelAguaMax);
+  picked(e, 'vivienda.inundadaAntes', d.vivienda.inundadaAntes);
+  needed(e, 'hogar.nombreReferencia', d.hogar.nombreReferencia);
+  if (!isBlank(d.hogar.telefonoContacto) && !PHONE_RE.test(d.hogar.telefonoContacto.trim())) e['hogar.telefonoContacto'] = 'Usa entre 7 y 30 caracteres: dígitos, + ( ) - y espacios.';
+  return e;
+}
+function validateRespondente() {
+  const r = ui.data.respondente; const e = {};
+  picked(e, 'respondente.esJefe', r.esJefe);
+  if (r.esJefe === false) needed(e, 'respondente.parentesco', r.parentesco, 'Indica el parentesco.');
+  if (!isBlank(r.edad) && !(toInt(r.edad) <= 120)) e['respondente.edad'] = 'Edad entre 0 y 120.';
+  return e;
+}
+function validateGrupos() {
+  const d = ui.data; const e = {};
+  const n = toInt(d.numPersonas);
+  if (!(n >= 1)) e.numPersonas = 'Indica cuántas personas viven en el hogar (mínimo 1).';
+  d.menores.forEach((age, i) => { if (!(toInt(age) <= 17)) e[`menores.${i}`] = 'Edad entre 0 y 17.'; });
+  if (n >= 1) {
+    if (d.menores.length > n) e.menores = `Hay más niños y niñas (${d.menores.length}) que personas en el hogar (${n}).`;
+    Object.entries(d.grupos).forEach(([code, qty]) => { if (qty > n) e[`grupos.${code}`] = `No puede superar ${n}.`; });
   }
+  return e;
+}
+function validateEscolaridad() {
+  const s = ui.data.escolaridad; const e = {};
+  picked(e, 'escolaridad.dejaronDeAsistir', s.dejaronDeAsistir);
+  if (s.dejaronDeAsistir === true && isBlank(s.diasSinAsistir)) e['escolaridad.diasSinAsistir'] = 'Indica los días.';
+  picked(e, 'escolaridad.manejoEstudios', s.manejoEstudios);
+  if (s.manejoEstudios === 'otro') needed(e, 'escolaridad.manejoOtro', s.manejoOtro, 'Describe cuál.');
+  return e;
+}
+function validateSituacion() {
+  const s = ui.data.situacion; const e = {};
+  picked(e, 'situacion.lugarPernocta', s.lugarPernocta);
+  picked(e, 'situacion.electricaDanada', s.electricaDanada);
+  picked(e, 'situacion.lodo', s.lodo);
+  picked(e, 'situacion.acceso', s.acceso);
+  if (s.medioAlerta === 'otro') needed(e, 'situacion.medioAlertaOtro', s.medioAlertaOtro, 'Describe cuál.');
+  if (s.ingresos === 'otro') needed(e, 'situacion.ingresosOtro', s.ingresosOtro, 'Describe cuál.');
+  return e;
+}
+function validateDanos() {
+  const e = {};
+  ui.catalogs.categoriasDano.forEach(c => { if (!Number.isInteger(ui.data.danos[c.codigo])) e[`danos.${c.codigo}`] = 'Elige un nivel.'; });
+  return e;
+}
+function validateNecesidades() {
+  const e = {};
+  if ('otro_condicion_especial' in ui.data.necesidades) needed(e, 'necesidades.otro_condicion_especial.detalle', ui.data.necesidades.otro_condicion_especial.detalle, 'Describe la condición.');
+  return e;
+}
+function validateVisitantes() {
+  const d = ui.data; const e = {};
+  if (!Object.values(d.visitantes).some(Boolean)) e.visitantes = 'Marca al menos una opción (o «Nadie»).';
+  if (d.visitantes.otro) needed(e, 'visitanteOtro', d.visitanteOtro, 'Indica quién.');
+  return e;
+}
+function validateAtencion() {
+  const d = ui.data; const a = d.atencion; const e = {};
+  picked(e, 'atencion.censoPrevio', a.censoPrevio);
+  picked(e, 'atencion.dictamen', a.dictamen);
+  picked(e, 'atencion.inscritaRud', a.inscritaRud);
+  picked(e, 'atencion.ofertaRecibida', a.ofertaRecibida);
+  if (a.ofertaRecibida === true) picked(e, 'atencion.ofertaAceptada', a.ofertaAceptada);
+  if (!Object.values(d.ayudas).some(Boolean)) e.ayudas = 'Marca las ayudas recibidas o «Ninguna».';
+  return e;
 }
 
-function render() {
-  app.innerHTML = state.view === 'consulta' ? consultaView() : state.submitted ? successView() : state.step === -1 ? welcomeView() : formView();
-  bindEvents();
+// ---------- payloads (solo se envía lo visible) ----------
+const text = v => String(v).trim();
+const optional = (obj, key, value) => { if (!isBlank(value)) obj[key] = typeof value === 'string' ? text(value) : value; };
+
+function fichaPayload() {
+  const d = ui.data;
+  const base = { voluntario: text(d.voluntario), fechaAplicacion: d.fechaAplicacion, autorizaTratamiento: d.autorizaTratamiento, versionConsentimiento: CONSENTIMIENTO_VERSION };
+  if (d.autorizaTratamiento !== true) return base;
+  const vivienda = { direccion: text(d.vivienda.direccion), materialParedes: d.vivienda.materialParedes, nivelAguaMax: d.vivienda.nivelAguaMax, inundadaAntes: d.vivienda.inundadaAntes };
+  optional(vivienda, 'interior', d.vivienda.interior); optional(vivienda, 'callejon', d.vivienda.callejon);
+  const hogar = { nombreReferencia: text(d.hogar.nombreReferencia) };
+  optional(hogar, 'telefonoContacto', d.hogar.telefonoContacto);
+  const body = { ...base, autorizaSeguimiento: d.autorizaSeguimiento, vivienda, hogar };
+  optional(body, 'observaciones', d.observaciones);
+  return body;
 }
 
-function welcomeView() {
-  return `<main class="welcome-page">
+const PAYLOADS = {
+  respondente() {
+    const r = ui.data.respondente;
+    const body = { esJefe: r.esJefe };
+    if (r.esJefe === false) body.parentesco = text(r.parentesco);
+    optional(body, 'genero', r.genero);
+    if (!isBlank(r.edad)) body.edad = toInt(r.edad);
+    return body;
+  },
+  grupos() {
+    const d = ui.data;
+    return {
+      numPersonas: toInt(d.numPersonas), menores: d.menores.map(toInt),
+      grupos: Object.entries(d.grupos).filter(([, qty]) => qty > 0).map(([grupo, cantidad]) => ({ grupo, cantidad }))
+    };
+  },
+  escolaridad() {
+    const s = ui.data.escolaridad;
+    const body = { dejaronDeAsistir: s.dejaronDeAsistir, manejoEstudios: s.manejoEstudios };
+    if (s.dejaronDeAsistir) body.diasSinAsistir = toInt(s.diasSinAsistir);
+    if (s.manejoEstudios === 'otro') body.manejoOtro = text(s.manejoOtro);
+    return body;
+  },
+  situacion() {
+    const s = ui.data.situacion;
+    const body = { lugarPernocta: s.lugarPernocta, electricaDanada: s.electricaDanada, lodo: s.lodo, acceso: s.acceso, numMascotas: Number(s.numMascotas) || 0 };
+    optional(body, 'medioAlerta', s.medioAlerta); optional(body, 'ingresos', s.ingresos);
+    if (s.medioAlerta === 'otro') body.medioAlertaOtro = text(s.medioAlertaOtro);
+    if (s.ingresos === 'otro') body.ingresosOtro = text(s.ingresosOtro);
+    if (s.viviendaVista !== null) body.viviendaVista = s.viviendaVista;
+    if (s.apoyoEmocional !== null) body.apoyoEmocional = s.apoyoEmocional;
+    return body;
+  },
+  danos() {
+    return { danos: sortByOrder(ui.catalogs.categoriasDano).map(c => ({ categoria: c.codigo, nivel: ui.data.danos[c.codigo] })) };
+  },
+  necesidades() {
+    const d = ui.data;
+    return {
+      necesidades: Object.keys(d.necesidades).map(item => {
+        const entry = { item };
+        const prio = d.prioridades.indexOf(item);
+        if (prio >= 0) entry.prioridad = prio + 1;
+        if (item === 'otro_condicion_especial') entry.detalle = text(d.necesidades[item].detalle);
+        return entry;
+      })
+    };
+  },
+  visitantes() {
+    const d = ui.data;
+    const actors = d.visitantes.nadie ? ['nadie'] : Object.keys(d.visitantes).filter(k => d.visitantes[k]);
+    return { visitantes: actors.map(actor => (actor === 'otro' ? { actor, detalle: text(d.visitanteOtro) } : { actor })) };
+  },
+  atencion() {
+    const d = ui.data; const a = d.atencion;
+    const body = { censoPrevio: a.censoPrevio, dictamen: a.dictamen, inscritaRud: a.inscritaRud, ofertaRecibida: a.ofertaRecibida, ayudasRecibidas: d.ayudas.ninguna ? [] : Object.keys(d.ayudas).filter(k => d.ayudas[k]) };
+    if (a.censoPrevio === 'si') optional(body, 'censoQuien', a.censoQuien);
+    if (a.ofertaRecibida) body.ofertaAceptada = a.ofertaAceptada;
+    return body;
+  }
+};
+
+// ---------- vistas ----------
+function render({ keepScroll = true } = {}) {
+  const scroll = window.scrollY;
+  const views = { home: homeView, wizard: wizardView, end: endView, consulta: consultaView, detail: detailView };
+  app.innerHTML = views[ui.view]();
+  if (ui.view === 'consulta' && ui.consulta.items) document.querySelector('#lista').innerHTML = listHtml();
+  window.scrollTo(0, keepScroll ? scroll : 0);
+  ui.anim = null;
+}
+
+function homeView() {
+  const draft = storage.get(DRAFT_KEY);
+  const status = ui.catalogsState === 'error'
+    ? `<div class="alert alert-warning text-start"><i class="bi bi-wifi-off"></i> No se pudo cargar el formulario desde el servidor. <button class="btn btn-link p-0 align-baseline" data-act="retry-catalogs">Reintentar</button></div>`
+    : ui.catalogsState === 'loading' ? '<p class="loading-line"><span class="spinner-border spinner-border-sm"></span> Conectando con el servidor…</p>' : '';
+  return `<main class="welcome-page fade-in">
     <div class="welcome-mark"><i class="bi bi-house-heart-fill"></i></div>
     <p class="eyebrow">LA IGUANÁ · MEDELLÍN</p>
     <h1>Caracterización<br>de hogares</h1>
-    <p class="lead">Registro rápido y sencillo para apoyar a las familias de la comunidad.</p>
-    <button class="btn btn-primary btn-lg w-100" data-action="start">Comenzar <i class="bi bi-arrow-right"></i></button>
-    <button class="btn btn-outline-primary w-100 mt-3" data-action="consulta"><i class="bi bi-search"></i> Consultar familias registradas</button>
-    <small>Solo necesitas unos minutos</small>
+    <p class="lead">Una ficha por hogar, paso a paso. Tus respuestas se guardan mientras avanzas.</p>
+    ${status}
+    ${draft ? `<button class="btn btn-primary btn-lg w-100 mb-2" data-act="resume"><i class="bi bi-play-fill"></i> Continuar ficha en borrador</button>
+      <button class="btn btn-outline-primary w-100" data-act="start">Empezar una ficha nueva</button>`
+      : '<button class="btn btn-primary btn-lg w-100" data-act="start">Comenzar <i class="bi bi-arrow-right"></i></button>'}
+    <button class="btn btn-link mt-3" data-act="consulta"><i class="bi bi-search"></i> Consultar fichas registradas</button>
   </main>`;
 }
 
-function formView() {
-  const title = steps[state.step];
+function wizardView() {
+  const steps = visibleSteps();
+  const step = currentStep();
+  const index = steps.findIndex(s => s.key === step.key);
+  const last = index === steps.length - 1;
+  const endsHere = step.key === 'consentimiento' && ui.data.autorizaTratamiento === false;
+  const banner = ui.banner.length ? `<div class="alert alert-danger alert-dismissible fade-in"><ul>${ui.banner.map(m => `<li>${esc(m)}</li>`).join('')}</ul><button class="btn-close" data-act="dismiss" aria-label="Cerrar"></button></div>` : '';
+  const animClass = ui.anim === 'fwd' ? 'slide-fwd' : ui.anim === 'back' ? 'slide-back' : '';
   return `<div class="app-shell">
-    <header class="topbar"><button class="icon-button" data-action="back" aria-label="Volver"><i class="bi bi-arrow-left"></i></button>
-      <strong>${state.step + 1}. ${title}</strong><span>${state.step + 1}/5</span></header>
-    <div class="progress rounded-0"><div class="progress-bar" style="width:${((state.step + 1) / 5) * 100}%"></div></div>
-    <main class="container form-container">
-      ${state.apiError ? `<div class="alert alert-danger alert-dismissible">${esc(state.apiError)}<button class="btn-close" data-action="clear-error" aria-label="Cerrar"></button></div>` : ''}
-      ${stepContent()}
-    </main>
-    <footer class="actions">${state.step > 0 ? '<button class="btn btn-outline-primary" data-action="previous"><i class="bi bi-arrow-left"></i> Atrás</button>' : '<span></span>'}
-      <button class="btn btn-primary" data-action="next">${state.step === 4 ? 'Finalizar' : 'Siguiente'} <i class="bi bi-arrow-right"></i></button></footer>
+    <header class="topbar"><button class="icon-button" data-act="back" aria-label="Volver"><i class="bi bi-arrow-left"></i></button>
+      <strong>${esc(step.title)}</strong><span>${index + 1}/${steps.length}</span></header>
+    <div class="steps-bar" aria-hidden="true">${steps.map((_, i) => `<i class="${i < index ? 'done' : i === index ? 'now' : ''}"></i>`).join('')}</div>
+    <main class="container form-container"><div class="step-body ${animClass}">${banner}${step.render()}</div></main>
+    <footer class="actions"><button class="btn btn-outline-primary" data-act="back" ${ui.saving ? 'disabled' : ''}><i class="bi bi-arrow-left"></i> Atrás</button>
+      <button class="btn btn-primary" data-act="next" ${ui.saving ? 'disabled' : ''}>${ui.saving ? '<span class="spinner-border spinner-border-sm me-2"></span>Guardando…' : `${endsHere ? 'Finalizar' : last ? 'Completar ficha' : 'Siguiente'} <i class="bi bi-${last ? 'check2' : 'arrow-right'}"></i>`}</button></footer>
   </div>`;
 }
 
-function card(title, icon, body) {
-  return `<section class="form-card"><h2><i class="bi ${icon}"></i>${title}</h2>${body}</section>`;
+const ALERTAS = [
+  ['duermeEnRiesgo', 'bi-moon-stars-fill', 'Duerme en un lugar de riesgo'],
+  ['urgenteSalud', 'bi-heart-pulse-fill', 'Urgencia de salud'],
+  ['urgenteAguaAlimento', 'bi-droplet-half', 'Urgencia de agua o alimento'],
+  ['electricaRiesgo', 'bi-lightning-charge-fill', 'Riesgo eléctrico']
+];
+function alertsHtml(seguimiento) {
+  if (!seguimiento) return '';
+  return `<section class="card-ui alerts"><h2><i class="bi bi-bell-fill"></i>Seguimiento urgente</h2>
+    ${ALERTAS.map(([key, icon, label]) => `<div class="alert-row ${seguimiento[key] ? 'on' : ''}"><i class="bi ${icon}"></i><span>${label}</span><b>${seguimiento[key] ? 'Sí' : 'No'}</b></div>`).join('')}
+    <div class="follow ${seguimiento.requiereSeguimiento ? 'on' : ''}"><i class="bi bi-${seguimiento.requiereSeguimiento ? 'exclamation-octagon-fill' : 'check-circle-fill'}"></i>${seguimiento.requiereSeguimiento ? 'Requiere seguimiento' : 'No requiere seguimiento por ahora'}</div></section>`;
 }
 
-function inputField(label, name, value, required = false, type = 'text', placeholder = '') {
-  const error = state.fieldErrors[name];
-  const max = maxFor(name);
-  return `<div class="mb-3"><label class="form-label" for="${name}">${label}${required ? ' <span class="required">*</span>' : ' <span class="optional">(opcional)</span>'}</label>
-    <input class="form-control ${error ? 'is-invalid' : ''}" id="${name}" name="${name}" type="${type}" value="${esc(value)}" placeholder="${placeholder}" ${required ? 'required' : ''} ${max ? `maxlength="${max}"` : ''} ${type === 'date' ? `max="${today()}"` : ''}>
-    ${error ? `<div class="invalid-feedback">${esc(error)}</div>` : ''}</div>`;
+function endView() {
+  const r = ui.result;
+  if (r.sinAutorizacion) {
+    return `<main class="success-page fade-in"><div class="success-icon muted"><i class="bi bi-slash-lg"></i></div><h1>Ficha cerrada</h1>
+      <p>La persona no autorizó el tratamiento de sus datos, así que no se registró información del hogar.</p>
+      <button class="btn btn-primary w-100" data-act="start"><i class="bi bi-plus-lg"></i> Nueva ficha</button><button class="btn btn-link mt-2" data-act="home">Volver al inicio</button></main>`;
+  }
+  const f = r.ficha;
+  return `<main class="success-page fade-in"><div class="success-icon"><i class="bi bi-check-lg"></i></div><h1>¡Ficha completada!</h1><p>Los datos se guardaron correctamente.</p>
+    <div class="codes"><div><small>Código del hogar</small><strong>${esc(f.hogar?.codigoHogar || '—')}</strong></div><div><small>Ficha</small><strong>#${esc(f.idFicha)}</strong></div></div>
+    <section class="card-ui w-100 text-start"><h2><i class="bi bi-clipboard-data-fill"></i>Resumen</h2>
+      ${summaryRow('bi-people-fill', 'Personas', f.resumen?.numPersonas ?? '—')}${summaryRow('bi-balloon-heart-fill', 'Niños y niñas', f.resumen?.ninos ?? '—')}
+      ${summaryRow('bi-person-heart', 'Adultos mayores', f.resumen?.adultosMayores ?? '—')}${summaryRow('bi-exclamation-triangle-fill', 'Total de daño', f.resumen?.totalDano ?? '—')}</section>
+    <div class="w-100 text-start">${alertsHtml(f.seguimiento)}</div>
+    <button class="btn btn-primary w-100" data-act="start"><i class="bi bi-plus-lg"></i> Nueva ficha</button>
+    <button class="btn btn-outline-primary w-100 mt-2" data-act="consulta"><i class="bi bi-search"></i> Consultar fichas</button></main>`;
 }
 
-function selectField(label, name, value, items, required = true) {
-  const error = state.fieldErrors[name];
-  return `<div class="mb-3"><label class="form-label" for="${name}">${label}${required ? ' <span class="required">*</span>' : ''}</label>
-    <select class="form-select ${error ? 'is-invalid' : ''}" id="${name}" name="${name}" ${required ? 'required' : ''}><option value="">Selecciona una opción</option>${optionList(items, value)}</select>
-    ${error ? `<div class="invalid-feedback">${esc(error)}</div>` : ''}</div>`;
-}
+// ---------- consulta ----------
+const estadoBadge = estado => `<span class="badge-estado ${esc(estado)}">${esc({ borrador: 'Borrador', completa: 'Completa', sin_autorizacion: 'Sin autorización' }[estado] || estado)}</span>`;
 
-function stepContent() {
-  if (state.step === 0) return card('Datos del hogar', 'bi-house-heart-fill',
-    inputField('Dirección de referencia', 'direccionReferencia', state.hogar.direccionReferencia, true, 'text', 'Ej. Calle 10, barrio La Iguaná') +
-    inputField('Observaciones', 'observacionesHogar', state.hogar.observaciones, false, 'text', 'Ej. Vivienda afectada por inundación'));
-  if (state.step === 1) return card('Datos de la familia', 'bi-people-fill',
-    inputField('Nombre de referencia', 'nombreReferencia', state.familia.nombreReferencia, true, 'text', 'Ej. María Pérez') +
-    inputField('Teléfono de contacto', 'telefonoContacto', state.familia.telefonoContacto, false, 'tel', 'Ej. 3001234567'));
-  if (state.step === 2) return peopleContent();
-  if (state.step === 3) return collectionContent('afectaciones', 'Puedes dejar este apartado vacío si no hay afectaciones.', 'Agregar afectación');
-  return collectionContent('necesidades', 'Puedes dejar este apartado vacío si no hay necesidades.', 'Agregar necesidad');
-}
-
-function peopleContent() {
-  const people = state.personas.map((person, index) => `<div class="person-card">
-    <div class="item-heading"><span class="number">${index + 1}</span><strong>Persona del hogar</strong>${state.personas.length > 1 ? `<button class="remove-button" data-remove-person="${index}" aria-label="Eliminar persona"><i class="bi bi-trash"></i></button>` : ''}</div>
-    ${inputField('Nombres', `personas.${index}.nombres`, person.nombres, true, 'text', 'Ej. María Pérez')}
-    ${inputField('Fecha de nacimiento', `personas.${index}.fechaNacimiento`, person.fechaNacimiento, false, 'date')}
-    <fieldset><legend>¿Requiere apoyo? <span class="required">*</span></legend>
-      <label class="form-check form-check-inline"><input class="form-check-input" type="radio" name="personas.${index}.requiereApoyo" value="false" ${!person.requiereApoyo ? 'checked' : ''}> No</label>
-      <label class="form-check form-check-inline"><input class="form-check-input" type="radio" name="personas.${index}.requiereApoyo" value="true" ${person.requiereApoyo ? 'checked' : ''}> Sí</label>
-    </fieldset>
-    ${inputField('Observaciones', `personas.${index}.observaciones`, person.observaciones, false, 'text', 'Información adicional')}
-  </div>`).join('');
-  return `<div class="section-intro">${people}<button class="btn btn-link add-link" data-action="add-person"><i class="bi bi-plus-lg"></i> Agregar otra persona</button></div>`;
-}
-
-function collectionContent(type, hint, addText) {
-  const isAfect = type === 'afectaciones';
-  const levelKey = isAfect ? 'nivelAfectacion' : 'nivelUrgencia';
-  const items = state[type].map((item, index) => `<div class="item-card">
-    <div class="item-heading"><strong>${isAfect ? 'Afectación' : 'Necesidad'} ${index + 1}</strong><button class="remove-button" data-remove="${type}" data-index="${index}" aria-label="Eliminar"><i class="bi bi-trash"></i></button></div>
-    ${selectField('Categoría', `${type}.${index}.categoria`, item.categoria, isAfect ? catalogs.categoriasAfectacion : catalogs.categoriasNecesidad)}
-    ${inputField('Descripción', `${type}.${index}.descripcion`, item.descripcion, true, 'text', isAfect ? 'Ej. Pérdida de electrodomésticos' : 'Ej. Refugio temporal')}
-    ${selectField(isAfect ? 'Nivel de afectación' : 'Nivel de urgencia', `${type}.${index}.${levelKey}`, item[levelKey], isAfect ? catalogs.nivelesAfectacion : catalogs.nivelesUrgencia)}
-  </div>`).join('');
-  return `<div class="section-intro"><div class="info-box"><i class="bi bi-info-circle"></i>${hint}</div>${items}<button class="btn btn-outline-primary add-button" data-add="${type}"><i class="bi bi-plus-lg"></i> ${addText}</button></div>`;
-}
-
-function successView() {
-  const result = state.submitted;
-  const count = n => `${n} registrada${n === 1 ? '' : 's'}`;
-  return `<main class="success-page"><div class="success-icon"><i class="bi bi-check-lg"></i></div><h1>¡Caracterización registrada!</h1><p>${esc(result.mensaje || 'Los datos se han guardado correctamente en el sistema.')}</p>
-    <div class="codes"><div><small>Código del hogar</small><strong>${esc(result.hogar.codigo)}</strong></div><div><small>Código de la familia</small><strong>${esc(result.familia.codigo)}</strong></div></div>
-    <section class="summary-card"><h2>Resumen</h2>
-      ${summaryRow('bi-house-heart-fill', 'Hogar', result.hogar.codigo, result.hogar.id)}
-      ${summaryRow('bi-people-fill', 'Familia', result.familia.codigo, result.familia.id)}
-      ${summaryRow('bi-person-fill', 'Personas', count(result.resumen.personas))}
-      ${summaryRow('bi-exclamation-triangle-fill', 'Afectaciones', count(result.resumen.afectaciones))}
-      ${summaryRow('bi-heart-fill', 'Necesidades', count(result.resumen.necesidades))}
-    </section><button class="btn btn-primary w-100" data-action="new"><i class="bi bi-plus-lg"></i> Nueva caracterización</button>
-    <button class="btn btn-outline-primary w-100 mt-2" data-action="consulta"><i class="bi bi-search"></i> Consultar familias registradas</button>
-  </main>`;
-}
-
-function summaryRow(icon, title, text, id = '') {
-  return `<div class="summary-row"><i class="bi ${icon}"></i><span><strong>${title}</strong><small>${esc(text)}${id ? ` · ID ${esc(id)}` : ''}</small></span></div>`;
-}
-
-// ---------- Consulta de familias registradas ----------
-
-const readLocal = () => { try { return JSON.parse(localStorage.getItem(STORE_KEY)) || []; } catch { return []; } };
-function saveLocalRecord(body) {
-  try {
-    const record = { hogar: body.hogar, familia: body.familia, resumen: body.resumen, fecha: new Date().toISOString() };
-    localStorage.setItem(STORE_KEY, JSON.stringify([record, ...readLocal()].slice(0, 50)));
-  } catch { /* almacenamiento no disponible */ }
+function listHtml() {
+  const c = ui.consulta;
+  const q = c.q.trim().toLowerCase();
+  const items = c.items.filter(i => !q || [i.codigoHogar, i.nombreReferencia, i.direccion, i.idFicha].some(v => String(v ?? '').toLowerCase().includes(q)));
+  if (!items.length) return '<p class="empty">No hay fichas que coincidan.</p>';
+  return items.map(i => `<button class="ficha-card" data-act="open-ficha" data-id="${esc(i.idFicha)}">
+    <div class="d-flex justify-content-between gap-2"><strong>${esc(i.codigoHogar || `Ficha #${i.idFicha}`)}</strong>${estadoBadge(i.estado)}</div>
+    <div>${esc(i.nombreReferencia || 'Sin nombre')}</div><small class="text-muted">${esc(i.direccion || '')}</small>
+    <small class="meta">${i.numPersonas ?? '–'} personas · ${i.ninos ?? 0} niños · daño ${i.totalDano ?? 0}</small></button>`).join('');
 }
 
 function consultaView() {
-  const c = state.consulta;
-  const local = readLocal();
-  const showLocal = !c.detail && !c.items && local.length;
-  return `<div class="app-shell">
-    <header class="topbar"><button class="icon-button" data-action="close-consulta" aria-label="Volver"><i class="bi bi-arrow-left"></i></button><strong>Familias registradas</strong><span></span></header>
-    <main class="container form-container">
-      <form class="search-box" data-form="buscar"><input class="form-control" name="query" value="${esc(c.query)}" placeholder="ID o código (ej. 3 o FAM-0003)">
-        <button class="btn btn-primary" type="submit" ${c.loading ? 'disabled' : ''} aria-label="Buscar"><i class="bi bi-search"></i></button></form>
-      <button class="btn btn-link p-0 mb-3" data-action="listar"><i class="bi bi-list-ul"></i> Ver todas las familias</button>
-      ${c.message ? `<div class="alert alert-${c.kind}">${esc(c.message)}</div>` : ''}
-      ${c.loading ? '<div class="text-center py-4"><span class="spinner-border text-primary"></span></div>' : ''}
-      ${c.detail ? detailCard(c.detail) : ''}
-      ${c.items ? c.items.map(item => detailCard(item, true)).join('') : ''}
-      ${showLocal ? `<h2 class="section-title">Registradas desde este dispositivo</h2>${local.map(r => `<div class="item-card">
-        <div class="d-flex justify-content-between gap-2"><strong>${esc(r.familia.codigo)} · ${esc(r.hogar.codigo)}</strong><small class="text-muted">${new Date(r.fecha).toLocaleString('es-CO')}</small></div>
-        <small>${r.resumen.personas} persona(s) · ${r.resumen.afectaciones} afectación(es) · ${r.resumen.necesidades} necesidad(es)</small>
-        <div><button class="btn btn-link p-0" data-lookup="${esc(r.familia.id)}">Consultar en la API</button></div></div>`).join('')}` : ''}
+  const c = ui.consulta;
+  return `<div class="app-shell"><header class="topbar"><button class="icon-button" data-act="home" aria-label="Volver"><i class="bi bi-arrow-left"></i></button><strong>Fichas registradas</strong><span></span></header>
+    <main class="container form-container fade-in">
+      <div class="search-box"><i class="bi bi-search"></i><input class="form-control" data-filter placeholder="Buscar por código, nombre, dirección o ID" value="${esc(c.q)}"></div>
+      ${c.loading ? '<div class="text-center py-5"><span class="spinner-border text-primary"></span></div>' : ''}
+      ${c.error ? `<div class="alert alert-danger">${esc(c.error)} <button class="btn btn-link p-0 align-baseline" data-act="consulta">Reintentar</button></div>` : ''}
+      <div id="lista"></div></main></div>`;
+}
+
+async function openConsulta() {
+  ui.view = 'consulta';
+  ui.consulta = { ...blankConsulta(), loading: true };
+  render({ keepScroll: false });
+  try {
+    ui.consulta.items = await api('GET', '/fichas?limite=100');
+  } catch (error) {
+    ui.consulta.error = error.messages[0];
+  }
+  ui.consulta.loading = false;
+  if (ui.view === 'consulta') render();
+}
+
+async function openFicha(id) {
+  ui.consulta.loading = true;
+  try {
+    ui.consulta.detail = await api('GET', `/fichas/${id}`);
+    ui.view = 'detail';
+  } catch (error) {
+    ui.consulta.error = error.messages[0];
+  }
+  ui.consulta.loading = false;
+  render({ keepScroll: false });
+}
+
+function detailView() {
+  const f = ui.consulta.detail;
+  const list = (title, icon, rows) => (rows.length ? card(title, icon, `<ul class="detail-list">${rows.map(r => `<li>${r}</li>`).join('')}</ul>`) : '');
+  const v = f.hogar?.vivienda || {};
+  return `<div class="app-shell"><header class="topbar"><button class="icon-button" data-act="consulta" aria-label="Volver"><i class="bi bi-arrow-left"></i></button><strong>${esc(f.hogar?.codigoHogar || `Ficha #${f.idFicha}`)}</strong>${estadoBadge(f.estado)}</header>
+    <main class="container form-container fade-in">
+      ${card('Hogar', 'bi-house-heart-fill', summaryRow('bi-person-fill', 'Referencia', `${f.hogar?.nombreReferencia || '—'}${f.hogar?.telefonoContacto ? ` · ${f.hogar.telefonoContacto}` : ''}`) +
+        summaryRow('bi-geo-alt-fill', 'Dirección', [v.direccion, v.interior && `Int. ${v.interior}`, v.callejon].filter(Boolean).join(', ') || '—') +
+        summaryRow('bi-bricks', 'Paredes', labelOf(OPTIONS.materialParedes, v.materialParedes) || '—') + summaryRow('bi-water', 'Nivel del agua', labelOf(OPTIONS.nivelAguaMax, v.nivelAguaMax) || '—') +
+        summaryRow('bi-calendar-event', 'Aplicada', `${String(f.fechaAplicacion).slice(0, 10)} por ${f.voluntario || '—'}`))}
+      ${f.resumen ? card('Resumen', 'bi-clipboard-data-fill', summaryRow('bi-people-fill', 'Personas', f.resumen.numPersonas) + summaryRow('bi-balloon-heart-fill', 'Niños y niñas', f.resumen.ninos) + summaryRow('bi-person-heart', 'Adultos mayores', f.resumen.adultosMayores) + summaryRow('bi-exclamation-triangle-fill', 'Total de daño', f.resumen.totalDano)) : ''}
+      ${alertsHtml(f.seguimiento)}
+      ${list('Integrantes', 'bi-diagram-3-fill', [...(f.menores?.length ? [`Menores: ${f.menores.map(m => `${esc(m)} años`).join(', ')}`] : []), ...(f.grupos || []).map(g => `${esc(cat('gruposIntegrantes', g.grupo))}: <b>${esc(g.cantidad)}</b>`)])}
+      ${list('Daños', 'bi-exclamation-triangle-fill', (f.danos || []).map(x => `${esc(cat('categoriasDano', x.categoria))}: <b>${esc(NIVELES_DANO.find(n => n.v === x.nivel)?.l ?? x.nivel)}</b>`))}
+      ${list('Necesidades', 'bi-heart-fill', (f.necesidades || []).map(n => `${n.prioridad ? `<b>#${esc(n.prioridad)}</b> ` : ''}${esc(cat('itemsNecesidad', n.item))}${n.detalle ? ` — ${esc(n.detalle)}` : ''}`))}
+      ${list('Visitas', 'bi-signpost-split-fill', (f.visitantes || []).map(x => `${esc(cat('actores', x.actor))}${x.detalle ? ` — ${esc(x.detalle)}` : ''}`))}
+      ${list('Ayudas recibidas', 'bi-box2-heart-fill', (f.ayudasRecibidas || []).map(x => esc(cat('tiposAyuda', x.tipoAyuda))))}
     </main></div>`;
 }
 
-function detailCard(data, compact = false) {
-  const familia = data.familia || data;
-  const hogar = data.hogar || familia.hogar || {};
-  const list = (title, rows) => rows.length ? `<div class="mt-2"><small class="text-muted">${title}</small><ul class="mb-0">${rows.map(row => `<li>${row}</li>`).join('')}</ul></div>` : '';
-  const personas = (data.personas || familia.personas || []).map(p => `${esc(p.nombres)}${p.fechaNacimiento ? ` (${esc(String(p.fechaNacimiento).slice(0, 10))})` : ''}${p.requiereApoyo ? ' · requiere apoyo' : ''}`);
-  const afectaciones = (data.afectaciones || []).map(a => `${esc(labelFor(catalogs.categoriasAfectacion, a.categoria))} — ${esc(labelFor(catalogs.nivelesAfectacion, a.nivelAfectacion))}: ${esc(a.descripcion)}`);
-  const necesidades = (data.necesidades || []).map(n => `${esc(labelFor(catalogs.categoriasNecesidad, n.categoria))} — urgencia ${esc(labelFor(catalogs.nivelesUrgencia, n.nivelUrgencia))}: ${esc(n.descripcion)}`);
-  return `<div class="item-card"><div class="item-heading"><strong>${esc(familia.codigo || '')}${hogar.codigo ? ` · ${esc(hogar.codigo)}` : ''}</strong>${familia.id ? `<small class="text-muted">ID ${esc(familia.id)}</small>` : ''}</div>
-    <div>${esc(familia.nombreReferencia || '')}${familia.telefonoContacto ? ` · ${esc(familia.telefonoContacto)}` : ''}</div>
-    ${hogar.direccionReferencia ? `<small class="text-muted">${esc(hogar.direccionReferencia)}</small>` : ''}
-    ${compact && data.resumen ? `<div><small>${data.resumen.personas} persona(s) · ${data.resumen.afectaciones} afectación(es) · ${data.resumen.necesidades} necesidad(es)</small></div><button class="btn btn-link p-0" data-lookup="${esc(familia.id)}">Ver detalle</button>` : ''}
-    ${compact ? '' : list('Personas', personas) + list('Afectaciones', afectaciones) + list('Necesidades', necesidades)}</div>`;
-}
-
-async function runConsulta(path, onOk) {
-  const c = state.consulta;
-  Object.assign(c, { loading: true, message: '', detail: null, items: null });
-  render();
+// ---------- flujo ----------
+async function loadCatalogs() {
+  ui.catalogsState = 'loading';
+  if (ui.view === 'home') render();
   try {
-    const response = await fetch(`${API_BASE_URL}${path}`);
-    const body = await response.json().catch(() => null);
-    if (response.ok) onOk(body);
-    else if (response.status === 404) Object.assign(c, { kind: 'warning', message: `No se encontró información en ${path}. Si el registro existe, el back aún no expone este endpoint de consulta.` });
-    else Object.assign(c, { kind: 'danger', message: `La consulta falló (${response.status}).` });
+    ui.catalogs = await api('GET', '/catalogos', undefined, { timeout: 12000 });
+    ui.catalogsState = 'ok';
   } catch {
-    Object.assign(c, { kind: 'danger', message: `No fue posible conectar con el servidor (${API_BASE_URL}).` });
+    ui.catalogsState = 'error';
   }
-  c.loading = false;
-  render();
+  if (ui.view === 'home') render();
 }
 
-function buscar(query) {
-  const q = String(query).trim();
-  state.consulta.query = q;
-  const id = /^\d+$/.test(q) ? q : String(parseInt(q.replace(/\D/g, ''), 10) || '');
-  if (!id) {
-    Object.assign(state.consulta, { kind: 'warning', message: 'Escribe un ID numérico o un código como FAM-0003.', detail: null, items: null });
+function goTo(key, anim) {
+  ui.stepKey = key;
+  ui.errors = {};
+  ui.banner = [];
+  ui.anim = anim;
+  persist();
+  render({ keepScroll: false });
+}
+
+function previous() {
+  const steps = visibleSteps();
+  const index = steps.findIndex(s => s.key === ui.stepKey);
+  if (index <= 0) { ui.view = 'home'; render({ keepScroll: false }); return; }
+  goTo(steps[index - 1].key, 'back');
+}
+
+async function save(step) {
+  const d = ui.data;
+  if (step.key === 'consentimiento') {
+    storage.set(VOL_KEY, text(d.voluntario));
+    if (d.autorizaTratamiento === false && !ui.idFicha) {
+      await api('POST', '/fichas', fichaPayload());
+      return 'end-sin-autorizacion';
+    }
+  } else if (step.key === 'vivienda') {
+    if (!ui.idFicha) ui.idFicha = (await api('POST', '/fichas', fichaPayload())).idFicha;
+  } else if (step.key === 'cierre') {
+    await api('POST', `/fichas/${ui.idFicha}/completar`);
+    return 'end-completa';
+  } else if (PAYLOADS[step.key]) {
+    await api('PUT', `/fichas/${ui.idFicha}/${step.key}`, PAYLOADS[step.key]());
+  }
+  return 'next';
+}
+
+async function next() {
+  const step = currentStep();
+  ui.errors = step.validate();
+  ui.banner = [];
+  if (Object.keys(ui.errors).length) {
+    ui.banner = ['Revisa los campos marcados antes de continuar.'];
     render();
+    document.querySelector('.has-error')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     return;
   }
-  runConsulta(`/caracterizacion/${id}`, body => { state.consulta.detail = body; });
-}
-
-function listar() {
-  runConsulta('/caracterizacion', body => {
-    const items = Array.isArray(body) ? body : body?.items || body?.data || [];
-    if (items.length) state.consulta.items = items;
-    else Object.assign(state.consulta, { kind: 'info', message: 'Aún no hay familias registradas.' });
-  });
-}
-
-// ---------- Formulario ----------
-
-function update(path, value) {
-  const [group, index, field] = path.split('.');
-  if (field) state[group][Number(index)][field] = value;
-  else if (group === 'observacionesHogar') state.hogar.observaciones = value;
-  else if (group in state.hogar) state.hogar[group] = value;
-  else if (group in state.familia) state.familia[group] = value;
-}
-
-function readForm() {
-  app.querySelectorAll('.form-container input, .form-container select').forEach(element => {
-    if (element.type === 'radio' && !element.checked) return;
-    update(element.name, element.type === 'radio' ? element.value === 'true' : element.value);
-  });
-}
-
-function validateStep() {
-  readForm();
-  state.fieldErrors = {};
-  if (state.step === 0) {
-    if (!state.hogar.direccionReferencia.trim()) state.fieldErrors.direccionReferencia = 'Ingresa la dirección de referencia.';
-  } else if (state.step === 1) {
-    if (!state.familia.nombreReferencia.trim()) state.fieldErrors.nombreReferencia = 'Ingresa el nombre de referencia.';
-  } else if (state.step === 2) {
-    state.personas.forEach((person, index) => {
-      if (!person.nombres.trim()) state.fieldErrors[`personas.${index}.nombres`] = 'Ingresa los nombres.';
-      if (person.fechaNacimiento && person.fechaNacimiento > today()) state.fieldErrors[`personas.${index}.fechaNacimiento`] = 'La fecha no puede ser futura.';
-    });
-  } else if (state.step === 3 || state.step === 4) {
-    const type = state.step === 3 ? 'afectaciones' : 'necesidades';
-    state[type].forEach((item, index) => {
-      if (!item.categoria) state.fieldErrors[`${type}.${index}.categoria`] = 'Selecciona una categoría.';
-      if (!item.descripcion.trim()) state.fieldErrors[`${type}.${index}.descripcion`] = 'Ingresa una descripción.';
-      const level = type === 'afectaciones' ? 'nivelAfectacion' : 'nivelUrgencia';
-      if (!item[level]) state.fieldErrors[`${type}.${index}.${level}`] = 'Selecciona un nivel.';
-    });
-  }
-  if (Object.keys(state.fieldErrors).length) { render(); return false; }
-  return true;
-}
-
-// Recorta textos y omite los opcionales vacíos: el back rechaza campos fuera del contrato
-const clean = (obj, optional) => Object.fromEntries(Object.entries(obj)
-  .map(([key, value]) => [key, typeof value === 'string' ? value.trim() : value])
-  .filter(([key, value]) => !(optional.includes(key) && value === '')));
-
-function payload() {
-  return {
-    hogar: clean(state.hogar, ['observaciones']),
-    familia: clean(state.familia, ['telefonoContacto']),
-    personas: state.personas.map(person => clean(person, ['fechaNacimiento', 'observaciones'])),
-    afectaciones: state.afectaciones.map(item => clean(item, [])),
-    necesidades: state.necesidades.map(item => clean(item, []))
-  };
-}
-
-// Ruta del 400 (hogar.observaciones, personas.0.nombres) -> nombre del campo en el formulario
-const routeToField = route => route === 'hogar.observaciones' ? 'observacionesHogar' : route.replace(/^(hogar|familia)\./, '');
-const stepOfField = name => name.startsWith('personas') ? 2 : name.startsWith('afectaciones') ? 3 : name.startsWith('necesidades') ? 4
-  : ['nombreReferencia', 'telefonoContacto'].includes(name) ? 1 : 0;
-const spanishError = message => /longer than/.test(message) ? 'El texto es demasiado largo.'
-  : /ISO 8601|date/i.test(message) ? 'La fecha no es válida.'
-  : /empty|must be/.test(message) ? 'Este campo es obligatorio o no es válido.' : 'Revisa este campo.';
-
-async function submit() {
-  state.apiError = '';
+  ui.saving = true;
   render();
-  const button = app.querySelector('[data-action="next"]');
-  button.disabled = true;
-  button.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Guardando...';
   try {
-    const response = await fetch(`${API_BASE_URL}/caracterizacion`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload()) });
-    const body = await response.json().catch(() => ({}));
-    if (response.status === 400) {
-      state.apiError = 'Revisa los campos marcados. Algunos datos no cumplen las reglas del formulario.';
-      state.fieldErrors = {};
-      (Array.isArray(body.message) ? body.message : []).forEach(message => {
-        state.fieldErrors[routeToField(message.split(' ')[0])] = spanishError(message);
-      });
-      const errorSteps = Object.keys(state.fieldErrors).map(stepOfField);
-      if (errorSteps.length) state.step = Math.min(...errorSteps);
-      render();
-      return;
+    const outcome = await save(step);
+    ui.saving = false;
+    if (outcome === 'end-sin-autorizacion') {
+      storage.del(DRAFT_KEY);
+      ui.result = { sinAutorizacion: true };
+      ui.view = 'end';
+      render({ keepScroll: false });
+    } else if (outcome === 'end-completa') {
+      const ficha = await api('GET', `/fichas/${ui.idFicha}`).catch(() => ({ idFicha: ui.idFicha }));
+      storage.del(DRAFT_KEY);
+      ui.result = { ficha };
+      ui.view = 'end';
+      render({ keepScroll: false });
+    } else {
+      const steps = visibleSteps();
+      flash('Guardado');
+      goTo(steps[steps.findIndex(s => s.key === step.key) + 1].key, 'fwd');
     }
-    if (response.status === 500) throw new Error('No fue posible registrar la caracterización. No se guardó nada; puedes intentarlo de nuevo con los mismos datos.');
-    if (!response.ok) throw new Error(body.message || 'No fue posible registrar la caracterización.');
-    saveLocalRecord(body);
-    state.submitted = body;
-    render();
   } catch (error) {
-    state.apiError = error instanceof TypeError
-      ? `No fue posible conectar con el servidor (${API_BASE_URL}). Verifica que la API esté corriendo y que este origen esté en CORS_ORIGIN.`
-      : error.message;
+    ui.saving = false;
+    ui.banner = error instanceof ApiError ? error.messages : ['Ocurrió un error inesperado.'];
+    if (error.status === 409) ui.banner.push('Esta ficha ya no está en borrador. Empieza una ficha nueva desde el inicio.');
     render();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 }
 
-function bindEvents() {
-  app.querySelectorAll('.form-container input, .form-container select').forEach(element => element.addEventListener('input', () => {
-    if (element.closest('[data-form]')) return;
-    update(element.name, element.type === 'radio' ? element.checked && element.value === 'true' : element.value);
-    delete state.fieldErrors[element.name];
-  }));
-  app.querySelector('[data-form="buscar"]')?.addEventListener('submit', event => {
-    event.preventDefault();
-    buscar(new FormData(event.target).get('query') || '');
-  });
-  app.onclick = handleClick;
+function flash(message) {
+  const el = document.createElement('div');
+  el.className = 'toast-ui';
+  el.innerHTML = `<i class="bi bi-check-circle-fill"></i> ${esc(message)}`;
+  document.body.append(el);
+  setTimeout(() => el.remove(), 1600);
 }
 
-function handleClick(event) {
-  const target = event.target.closest('[data-action], [data-add], [data-remove], [data-remove-person], [data-lookup]');
-  if (!target) return;
-  const action = target.dataset.action;
-  if (action === 'start') { state.step = 0; render(); }
-  if (action === 'back') { state.step === 0 ? (state.step = -1) : state.step--; render(); }
-  if (action === 'previous') { state.step--; render(); }
-  if (action === 'clear-error') { state.apiError = ''; render(); }
-  if (action === 'new') { state = blankState(); render(); }
-  if (action === 'consulta') { state.view = 'consulta'; state.consulta = blankConsulta(); render(); }
-  if (action === 'close-consulta') { state = blankState(); state.step = -1; render(); }
-  if (action === 'listar') listar();
-  if (target.dataset.lookup) buscar(target.dataset.lookup);
-  if (action === 'add-person') { readForm(); state.personas.push({ nombres: '', fechaNacimiento: '', requiereApoyo: false, observaciones: '' }); render(); }
-  if (action === 'next') { if (validateStep()) state.step === 4 ? submit() : (state.step++, render()); }
-  if (target.dataset.add) {
-    readForm(); state[target.dataset.add].push(target.dataset.add === 'afectaciones'
-      ? { categoria: '', descripcion: '', nivelAfectacion: '' } : { categoria: '', descripcion: '', nivelUrgencia: '' }); render();
+async function startNew() {
+  if (ui.catalogsState !== 'ok') await loadCatalogs();
+  if (ui.catalogsState !== 'ok') return;
+  storage.del(DRAFT_KEY);
+  Object.assign(ui, { view: 'wizard', stepKey: 'consentimiento', idFicha: null, data: blankData(), errors: {}, banner: [], anim: 'fwd' });
+  render({ keepScroll: false });
+}
+
+async function resume() {
+  if (ui.catalogsState !== 'ok') await loadCatalogs();
+  const draft = storage.get(DRAFT_KEY);
+  if (ui.catalogsState !== 'ok' || !draft) return;
+  Object.assign(ui, { view: 'wizard', stepKey: draft.stepKey, idFicha: draft.idFicha, data: { ...blankData(), ...draft.data }, errors: {}, banner: [], anim: 'fwd' });
+  render({ keepScroll: false });
+}
+
+// ---------- eventos (delegados, se registran una sola vez) ----------
+function toggleMulti(group, code) {
+  if (group === 'necesidades') {
+    const needs = ui.data.necesidades;
+    if (code in needs) {
+      delete needs[code];
+      ui.data.prioridades = ui.data.prioridades.map(p => (p === code ? '' : p));
+    } else {
+      needs[code] = code === 'otro_condicion_especial' ? { detalle: '' } : {};
+    }
+    return;
   }
-  if (target.dataset.remove) { readForm(); state[target.dataset.remove].splice(Number(target.dataset.index), 1); render(); }
-  if (target.dataset.removePerson) { readForm(); state.personas.splice(Number(target.dataset.removePerson), 1); render(); }
+  const bag = ui.data[group];
+  const exclusive = group === 'visitantes' ? 'nadie' : 'ninguna';
+  if (code === exclusive) {
+    const was = Boolean(bag[exclusive]);
+    Object.keys(bag).forEach(k => delete bag[k]);
+    if (!was) bag[exclusive] = true;
+  } else {
+    delete bag[exclusive];
+    if (bag[code]) delete bag[code]; else bag[code] = true;
+  }
 }
 
-// Se muestra de inmediato con el catálogo del contrato; si la API responde, se actualiza en segundo plano
-state.step = -1;
+app.addEventListener('click', event => {
+  const t = event.target.closest('button');
+  if (!t || t.disabled) return;
+  const { act, choice: path, toggle, stepper: stepPath } = t.dataset;
+  if (path) {
+    const value = JSON.parse(t.dataset.value);
+    setVal(path, val(path) === value && t.dataset.clear === '1' ? (typeof value === 'boolean' ? null : '') : value);
+    delete ui.errors[path];
+    persist(); render(); return;
+  }
+  if (toggle) { const [group, code] = toggle.split(':'); toggleMulti(group, code); delete ui.errors[group]; persist(); render(); return; }
+  if (stepPath) {
+    const current = val(stepPath);
+    const { delta, min, max } = Object.fromEntries(['delta', 'min', 'max'].map(k => [k, Number(t.dataset[k])]));
+    const empty = current === '' || current === undefined;
+    const nextValue = empty ? (min === 0 ? Math.max(0, Math.min(max, delta)) : min) : Math.min(max, Math.max(min, Number(current) + delta));
+    setVal(stepPath, nextValue);
+    delete ui.errors[stepPath];
+    persist(); render(); return;
+  }
+  const actions = {
+    start: startNew, resume, next, back: () => (ui.view === 'wizard' ? previous() : null),
+    home: () => { ui.view = 'home'; render({ keepScroll: false }); },
+    consulta: openConsulta,
+    'open-ficha': () => openFicha(t.dataset.id),
+    'retry-catalogs': loadCatalogs,
+    dismiss: () => { ui.banner = []; render(); },
+    'add-menor': () => { ui.data.menores.push(''); persist(); render(); },
+    'del-menor': () => { ui.data.menores.splice(Number(t.dataset.index), 1); ui.errors = {}; persist(); render(); }
+  };
+  actions[act]?.();
+});
+
+app.addEventListener('input', event => {
+  const el = event.target;
+  if (el.dataset.filter !== undefined) {
+    ui.consulta.q = el.value;
+    document.querySelector('#lista').innerHTML = listHtml();
+    return;
+  }
+  if (!el.dataset.path) return;
+  setVal(el.dataset.path, el.value);
+  delete ui.errors[el.dataset.path];
+  el.closest('.field, .menor-row')?.classList.remove('has-error');
+  persist();
+});
+
+app.addEventListener('change', event => {
+  const el = event.target;
+  if (el.dataset.prio === undefined) return;
+  const slots = ui.data.prioridades;
+  slots[Number(el.dataset.prio)] = el.value;
+  slots.forEach((code, i) => { if (code && code === el.value && i !== Number(el.dataset.prio)) slots[i] = ''; });
+  persist(); render();
+});
+
 render();
-loadCatalogs().then(() => { if (state.step === -1 && state.view === 'form') render(); });
+loadCatalogs();
